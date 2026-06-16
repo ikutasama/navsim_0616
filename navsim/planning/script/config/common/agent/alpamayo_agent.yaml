@@ -1,0 +1,10 @@
+_target_: navsim.agents.alpamayo_agent.AlpamayoAgent
+model_path: nvidia/Alpamayo-1.5-10B
+trajectory_sampling:
+  time_horizon: 4
+  interval_length: 0.5
+num_traj_samples: 1
+top_p: 0.98
+temperature: 0.6
+max_generation_length: 256
+device: cuda

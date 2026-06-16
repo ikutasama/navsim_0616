@@ -1,0 +1,40 @@
+# NavSim assets (large images)
+navsim/assets/
+
+# Large data YAML files (scene tokens, training splits)
+navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtrain.yaml
+navsim/navsim/planning/script/config/common/train_test_split/navtrain.yaml
+navsim/navsim/planning/script/config/training/default_train_val_test_log_split.yaml
+
+# Alpamayo notebooks (optional, can be kept)
+# alpamayo1.5/notebooks/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+*.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (download on server)
+*.safetensors
+*.bin
+*.pt
+*.ckpt
