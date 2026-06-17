@@ -35,28 +35,18 @@ def step1_imports():
         ("numpy", lambda: f"version={__import__('numpy').__version__}"),
     ]
 
-    # GPU-dependent imports
-    gpu_checks = [
+    # Nested imports need importlib
+    import importlib
+
+    all_checks = checks + [
         ("flash_attn", lambda: f"version={__import__('flash_attn').__version__}"),
         ("alpamayo1_5.models.alpamayo1_5", lambda: "Alpamayo1_5 class OK"),
         ("alpamayo1_5.helper", lambda: "helper module OK"),
     ]
 
-    for mod, desc_fn in checks:
+    for mod, desc_fn in all_checks:
         try:
-            m = __import__(mod)
-            logger.info(f"  {mod}: {desc_fn()}")
-        except ImportError as e:
-            logger.error(f"  {mod}: FAIL - {e}")
-            ok = False
-
-    for mod, desc_fn in gpu_checks:
-        try:
-            # For nested imports
-            parts = mod.split('.')
-            obj = __import__(parts[0])
-            for p in parts[1:]:
-                obj = getattr(obj, p)
+            m = importlib.import_module(mod)
             logger.info(f"  {mod}: {desc_fn()}")
         except ImportError as e:
             logger.error(f"  {mod}: FAIL - {e}")
