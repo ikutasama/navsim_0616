@@ -289,7 +289,8 @@ class AlpamayoAgent(AbstractAgent):
 
         # Build xyz (z=0) and rotation matrices
         interp_xyz = np.stack([interp_x, interp_y, np.zeros(num_history_steps)], axis=-1)
-        interp_rot = spt.Rotation.from_euler('z', interp_heading).as_matrix()
+        # from_euler('z', ...) requires last dim = 1 (number of axes)
+        interp_rot = spt.Rotation.from_euler('z', interp_heading.reshape(-1, 1)).as_matrix()
         # (16, 3, 3)
 
         # Convert to tensors with batch dimensions: (1, 1, 16, 3) and (1, 1, 16, 3, 3)

@@ -136,7 +136,7 @@ def navsim_to_alpamayo(agent_input):
     interp_heading = np.interp(alp_times, navsim_times, headings_unwrapped)
 
     interp_xyz = np.stack([interp_x, interp_y, np.zeros(num_history_steps)], axis=-1)
-    interp_rot = spt.Rotation.from_euler('z', interp_heading).as_matrix()
+    interp_rot = spt.Rotation.from_euler('z', interp_heading.reshape(-1, 1)).as_matrix()
 
     ego_history_xyz = torch.from_numpy(interp_xyz).float().unsqueeze(0).unsqueeze(0)
     ego_history_rot = torch.from_numpy(interp_rot).float().unsqueeze(0).unsqueeze(0)
