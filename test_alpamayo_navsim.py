@@ -4,11 +4,14 @@
 在远程GPU服务器上运行，逐步验证每个环节。
 
 Usage:
-  python test_alpamayo_navsim.py --split mini --step 1
-  python test_alpamayo_navsim.py --split mini --step 2
-  python test_alpamayo_navsim.py --split mini --step 3
-  python test_alpamayo_navsim.py --split mini --step 4
-  python test_alpamayo_navsim.py --split mini --step 5
+  python test_alpamayo_navsim.py --step 1
+  python test_alpamayo_navsim.py --step 2 --navsim_log_path PATH --sensor_blobs_path PATH
+  python test_alpamayo_navsim.py --step 3 --navsim_log_path PATH --sensor_blobs_path PATH
+  python test_alpamayo_navsim.py --step 4 --navsim_log_path PATH --sensor_blobs_path PATH --model_path PATH
+  python test_alpamayo_navsim.py --step 5 --navsim_log_path PATH --sensor_blobs_path PATH --metric_cache_path PATH --model_path PATH
+
+Step 5 runs independently: loads data, inference, then PDM scoring.
+No need to rerun step 2/4 before step 5.
 """
 
 import argparse
@@ -35,7 +38,6 @@ def step1_imports():
         ("numpy", lambda: f"version={__import__('numpy').__version__}"),
     ]
 
-    # Nested imports need importlib
     import importlib
 
     all_checks = checks + [
@@ -95,7 +97,6 @@ def step2_navsim_data(navsim_log_path, sensor_blobs_path):
         agent_input = scene_loader.get_agent_input_from_token(token)
         scene = scene_loader.get_scene_from_token(token)
 
-        # 检查数据
         logger.info(f"  ego_statuses数量: {len(agent_input.ego_statuses)}")
         logger.info(f"  cameras数量: {len(agent_input.cameras)}")
 
@@ -136,7 +137,6 @@ def step3_conversion(agent_input):
         logger.info(f"  ego_history_xyz: {ego_xyz.shape} (期望 1,1,16,3)")
         logger.info(f"  ego_history_rot: {ego_rot.shape} (期望 1,1,16,3,3)")
 
-        # 验证数值范围
         logger.info(f"  xyz范围: x=[{ego_xyz[0,0,:,0].min():.3f},{ego_xyz[0,0,:,0].max():.3f}], "
                      f"y=[{ego_xyz[0,0,:,1].min():.3f},{ego_xyz[0,0,:,1].max():.3f}]")
 
@@ -148,7 +148,7 @@ def step3_conversion(agent_input):
         return False
 
 
-def step4_inference(agent_input, model_path="nvidia/Alpamayo-1.5-10B"):
+def step4_inference(agent_input, model_path="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B"):
     """GPU推理：加载模型并跑一个场景"""
     logger.info("=== STEP 4: GPU推理 ===")
 
@@ -188,44 +188,90 @@ def step4_inference(agent_input, model_path="nvidia/Alpamayo-1.5-10B"):
         return None
 
 
-def step5_pdm_score(trajectory, scene, metric_cache_path):
-    """计算PDM分数"""
+def step5_pdm_score(navsim_log_path, sensor_blobs_path, metric_cache_path, model_path):
+    """独立计算PDM分数：加载数据→推理→评分，无需先跑step 2/4"""
     logger.info("=== STEP 5: PDM评分 ===")
 
-    if trajectory is None or scene is None:
-        logger.error("没有trajectory或scene!")
-        return None
+    import torch
+    from pathlib import Path
+    from navsim.common.dataloader import SceneLoader, SceneFilter, MetricCacheLoader
+    from navsim.common.dataclasses import SensorConfig
+    from navsim.agents.alpamayo_agent.alpamayo_agent import AlpamayoAgent
+    from navsim.evaluate.pdm_score import pdm_score
+    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
+    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer, PDMScorerConfig
+    from navsim.traffic_agents_policies.log_replay_traffic_agents import LogReplayTrafficAgents
+    from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
     if not metric_cache_path:
         logger.error("需要metric_cache_path! 先运行metric caching脚本.")
         logger.info("  python navsim/navsim/planning/script/run_metric_caching.py train_test_split=navmini")
         return None
 
-    from pathlib import Path
-    from navsim.common.dataloader import MetricCacheLoader
-    from navsim.evaluate.pdm_score import pdm_score
-    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
-    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer, PDMScorerConfig
-    from navsim.traffic_agents_policies.log_replay_traffic_agents import LogReplayTrafficAgentsPolicy
-    from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
-
     try:
         proposal_sampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
+
+        # 1. 加载metric cache，拿一个token
+        logger.info("  加载metric cache...")
         metric_cache_loader = MetricCacheLoader(Path(metric_cache_path))
+        cache_tokens = list(metric_cache_loader.tokens)
+        logger.info(f"  metric cache中有 {len(cache_tokens)} 个tokens")
 
-        token = scene.scene_metadata.initial_token
-        logger.info(f"  token: {token}")
-
-        if token not in metric_cache_loader.tokens:
-            logger.error(f"  token不在metric cache中! 需要先caching.")
+        if len(cache_tokens) == 0:
+            logger.error("  metric cache为空! 先运行metric caching.")
             return None
 
+        token = cache_tokens[0]
+        logger.info(f"  使用token: {token}")
+
+        # 2. 加载NavSim数据拿到agent_input和scene
+        logger.info("  加载NavSim场景数据...")
+        sensor_config = SensorConfig(
+            cam_f0=[0, 1, 2, 3], cam_l0=[0, 1, 2, 3], cam_l1=False, cam_l2=False,
+            cam_r0=[0, 1, 2, 3], cam_r1=False, cam_r2=False, cam_b0=False, lidar_pc=False,
+        )
+        scene_filter = SceneFilter(num_history_frames=4, num_future_frames=10, max_scenes=2)
+
+        scene_loader = SceneLoader(
+            data_path=Path(navsim_log_path),
+            synthetic_sensor_path=Path(sensor_blobs_path),
+            original_sensor_path=Path(sensor_blobs_path),
+            synthetic_scenes_path=Path(navsim_log_path),
+            scene_filter=scene_filter,
+            sensor_config=sensor_config,
+        )
+
+        # 用metric cache的token在scene_loader里查找对应的agent_input
+        if token not in scene_loader.tokens_stage_one:
+            logger.warning(f"  token {token} 不在stage-1 tokens中，使用第一个可用token")
+            token = scene_loader.tokens_stage_one[0]
+
+        agent_input = scene_loader.get_agent_input_from_token(token)
+        scene = scene_loader.get_scene_from_token(token)
+
+        # 3. 加载模型并推理
+        logger.info("  加载Alpamayo模型并推理...")
+        if not torch.cuda.is_available():
+            logger.error("CUDA不可用!")
+            return None
+
+        agent = AlpamayoAgent(
+            trajectory_sampling=proposal_sampling,
+            model_path=model_path,
+        )
+        agent.initialize()
+        trajectory = agent.compute_trajectory(agent_input)
+
+        logger.info(f"  推理输出: shape={trajectory.poses.shape}")
+
+        # 4. 从metric cache拿对应的数据并计算PDM score
+        logger.info("  计算PDM score...")
         metric_cache = metric_cache_loader.get_from_token(token)
 
         simulator = PDMSimulator(proposal_sampling=proposal_sampling)
         scorer_config = PDMScorerConfig(proposal_sampling=proposal_sampling)
         scorer = PDMScorer(config=scorer_config)
-        traffic_policy = LogReplayTrafficAgentsPolicy()
+        traffic_policy = LogReplayTrafficAgents(proposal_sampling)
 
         score_row, _ = pdm_score(
             metric_cache=metric_cache,
@@ -253,7 +299,7 @@ def step5_pdm_score(trajectory, scene, metric_cache_path):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="分步测试Alpamayo1.5在NavSim上的表现")
     parser.add_argument("--step", type=int, required=True, choices=[1,2,3,4,5],
                         help="运行哪一步测试")
     parser.add_argument("--navsim_log_path", type=str,
@@ -271,9 +317,8 @@ def main():
         if not args.navsim_log_path:
             logger.error("需要 --navsim_log_path 或设置 OPENSCENE_DATA_ROOT")
             sys.exit(1)
-        agent_input, scene = step2_navsim_data(args.navsim_log_path, args.sensor_blobs_path)
+        step2_navsim_data(args.navsim_log_path, args.sensor_blobs_path)
     elif args.step == 3:
-        # 先跑step 2拿数据
         if not args.navsim_log_path:
             logger.error("需要数据路径")
             sys.exit(1)
@@ -286,16 +331,17 @@ def main():
             sys.exit(1)
         agent_input, scene = step2_navsim_data(args.navsim_log_path, args.sensor_blobs_path)
         if agent_input:
-            trajectory = step4_inference(agent_input, args.model_path)
+            step4_inference(agent_input, args.model_path)
     elif args.step == 5:
         if not args.navsim_log_path:
-            logger.error("需要数据路径")
+            logger.error("需要 --navsim_log_path 或设置 OPENSCENE_DATA_ROOT")
             sys.exit(1)
-        agent_input, scene = step2_navsim_data(args.navsim_log_path, args.sensor_blobs_path)
-        if agent_input:
-            trajectory = step4_inference(agent_input, args.model_path)
-            if trajectory:
-                step5_pdm_score(trajectory, scene, args.metric_cache_path)
+        step5_pdm_score(
+            navsim_log_path=args.navsim_log_path,
+            sensor_blobs_path=args.sensor_blobs_path,
+            metric_cache_path=args.metric_cache_path,
+            model_path=args.model_path,
+        )
 
 
 if __name__ == "__main__":
