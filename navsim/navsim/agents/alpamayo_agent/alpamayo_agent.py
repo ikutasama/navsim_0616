@@ -63,7 +63,7 @@ class AlpamayoAgent(AbstractAgent):
 
     def __init__(
         self,
-        model_path: str = "nvidia/Alpamayo-1.5-10B",
+        model_path: str = "/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B",
         trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=4, interval_length=0.5),
         num_traj_samples: int = 1,
         top_p: float = 0.98,

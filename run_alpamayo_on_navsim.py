@@ -183,7 +183,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run Alpamayo1.5 on NavSim data")
     parser.add_argument("--navsim_log_path", type=str, required=True)
     parser.add_argument("--sensor_blobs_path", type=str, required=True)
-    parser.add_argument("--model_path", type=str, default="nvidia/Alpamayo-1.5-10B")
+    parser.add_argument("--model_path", type=str, default="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B")
     parser.add_argument("--token", type=str, required=True, help="NavSim scene token")
     parser.add_argument("--num_traj_samples", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda")

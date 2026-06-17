@@ -262,7 +262,7 @@ def main():
                         default=os.environ.get("OPENSCENE_DATA_ROOT", ""))
     parser.add_argument("--metric_cache_path", type=str,
                         default=os.environ.get("OPENSCENE_DATA_ROOT", "") + "/metric_cache")
-    parser.add_argument("--model_path", type=str, default="nvidia/Alpamayo-1.5-10B")
+    parser.add_argument("--model_path", type=str, default="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B")
     args = parser.parse_args()
 
     if args.step == 1:
