@@ -161,7 +161,7 @@ def step4_inference(agent_input, model_path="nvidia/Alpamayo-1.5-10B"):
         return None
 
     logger.info(f"  GPU: {torch.cuda.get_device_name(0)}, "
-                f"VRAM: {torch.cuda.get_device_properties(0).total_mem/1e9:.1f}GB")
+                f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
 
     try:
         agent = AlpamayoAgent(
