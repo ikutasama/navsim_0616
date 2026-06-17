@@ -274,8 +274,8 @@ def step5_pdm_score(navsim_log_path, sensor_blobs_path, metric_cache_path, model
         metric_cache = metric_cache_loader.get_from_token(token)
 
         simulator = PDMSimulator(proposal_sampling=proposal_sampling)
-        scorer_config = PDMScorerConfig(proposal_sampling=proposal_sampling)
-        scorer = PDMScorer(config=scorer_config)
+        scorer_config = PDMScorerConfig()
+        scorer = PDMScorer(proposal_sampling=proposal_sampling, config=scorer_config)
         traffic_policy = LogReplayTrafficAgents(proposal_sampling)
 
         score_row, _ = pdm_score(
