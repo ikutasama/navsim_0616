@@ -1,16 +1,16 @@
-wget https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_metadata_test.tgz
+wget --no-check-certificate https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_metadata_test.tgz
 tar -xzf openscene_metadata_test.tgz
 rm openscene_metadata_test.tgz
 
 for split in {0..31}; do
-    wget https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_sensor_test_camera/openscene_sensor_test_camera_${split}.tgz
+    wget --no-check-certificate https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_sensor_test_camera/openscene_sensor_test_camera_${split}.tgz
     echo "Extracting file openscene_sensor_test_camera_${split}.tgz"
     tar -xzf openscene_sensor_test_camera_${split}.tgz
     rm openscene_sensor_test_camera_${split}.tgz
 done
 
 for split in {0..31}; do
-    wget https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_sensor_test_lidar/openscene_sensor_test_lidar_${split}.tgz
+    wget --no-check-certificate https://huggingface.co/datasets/OpenDriveLab/OpenScene/resolve/main/openscene-v1.1/openscene_sensor_test_lidar/openscene_sensor_test_lidar_${split}.tgz
     echo "Extracting file openscene_sensor_test_lidar_${split}.tgz"
     tar -xzf openscene_sensor_test_lidar_${split}.tgz
     rm openscene_sensor_test_lidar_${split}.tgz
