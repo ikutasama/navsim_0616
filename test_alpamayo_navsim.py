@@ -211,26 +211,23 @@ def step5_pdm_score(navsim_log_path, sensor_blobs_path, metric_cache_path, model
     try:
         proposal_sampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
 
-        # 1. 加载metric cache，拿一个token
+        # 1. 加载metric cache
         logger.info("  加载metric cache...")
         metric_cache_loader = MetricCacheLoader(Path(metric_cache_path))
-        cache_tokens = list(metric_cache_loader.tokens)
+        cache_tokens = set(metric_cache_loader.tokens)
         logger.info(f"  metric cache中有 {len(cache_tokens)} 个tokens")
 
         if len(cache_tokens) == 0:
             logger.error("  metric cache为空! 先运行metric caching.")
             return None
 
-        token = cache_tokens[0]
-        logger.info(f"  使用token: {token}")
-
-        # 2. 加载NavSim数据拿到agent_input和scene
+        # 2. 加载NavSim数据（不限制max_scenes，加载全部mini场景）
         logger.info("  加载NavSim场景数据...")
         sensor_config = SensorConfig(
             cam_f0=[0, 1, 2, 3], cam_l0=[0, 1, 2, 3], cam_l1=False, cam_l2=False,
             cam_r0=[0, 1, 2, 3], cam_r1=False, cam_r2=False, cam_b0=False, lidar_pc=False,
         )
-        scene_filter = SceneFilter(num_history_frames=4, num_future_frames=10, max_scenes=2)
+        scene_filter = SceneFilter(num_history_frames=4, num_future_frames=10)
 
         scene_loader = SceneLoader(
             data_path=Path(navsim_log_path),
@@ -240,11 +237,19 @@ def step5_pdm_score(navsim_log_path, sensor_blobs_path, metric_cache_path, model
             scene_filter=scene_filter,
             sensor_config=sensor_config,
         )
+        scene_tokens = set(scene_loader.tokens_stage_one)
+        logger.info(f"  SceneLoader有 {len(scene_tokens)} 个stage-1 tokens")
 
-        # 用metric cache的token在scene_loader里查找对应的agent_input
-        if token not in scene_loader.tokens_stage_one:
-            logger.warning(f"  token {token} 不在stage-1 tokens中，使用第一个可用token")
-            token = scene_loader.tokens_stage_one[0]
+        # 3. 找一个同时存在于metric_cache和scene_loader的token
+        common_tokens = list(cache_tokens & scene_tokens)
+        if len(common_tokens) == 0:
+            logger.error("  metric_cache和scene_loader没有共同token! 检查数据路径是否一致.")
+            logger.info(f"  metric_cache tokens示例: {list(cache_tokens)[:3]}")
+            logger.info(f"  scene_loader tokens示例: {list(scene_tokens)[:3]}")
+            return None
+
+        token = common_tokens[0]
+        logger.info(f"  使用token: {token}")
 
         agent_input = scene_loader.get_agent_input_from_token(token)
         scene = scene_loader.get_scene_from_token(token)
