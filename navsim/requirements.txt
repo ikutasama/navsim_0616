@@ -1,5 +1,5 @@
 nuplan-devkit @ git+https://github.com/motional/nuplan-devkit/@nuplan-devkit-v1.2
-scikit-learn==1.2.2
+scikit-learn>=1.2.2
 positional-encodings==6.0.1
 
 # nuplan requirements
@@ -10,12 +10,12 @@ casadi  # Used for optimization solving
 control==0.9.1  # Used for LQR controller synthesis
 Fiona  # Used in GpkgMapsDB.py
 geopandas>=0.12.1  # Used to read maps
-guppy3==3.1.2
+guppy3>=3.1.2
 hydra-core==1.2.0  # Used for configs
 joblib
 matplotlib  # Used for rendering
 nest_asyncio  # Used to nest event loops when running nuBoard/jupyter
-numpy==1.23.4
+numpy>=1.23.4
 opencv-python==4.9.0.80  # Used widely
 pandas    # Used widely
 Pillow    # Used widely to render images
@@ -39,8 +39,8 @@ tornado  # Used in nuboard.py
 tqdm  # Used widely
 ujson  # Used in serialiation_callback.py
 
-torch==2.0.1
-torchvision==0.15.2
+torch>=2.0.1
+torchvision>=0.15.2
 pytorch-lightning==2.2.1
 tensorboard==2.16.2
 protobuf==4.25.3
