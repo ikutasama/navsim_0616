@@ -250,25 +250,37 @@ def main():
         if feat not in out_df.columns:
             continue
         for target in targets:
-            valid = out_df[[feat, target]].dropna()
-            if len(valid) > 5:
+            # If feat == target, out_df[[feat, target]] creates duplicate column names;
+            # valid[feat] then returns a DataFrame and pandas.corr() crashes. Skip self-corr.
+            if feat == target:
+                continue
+            pair = out_df[[feat, target]].copy()
+            pair[feat] = pd.to_numeric(pair[feat], errors="coerce")
+            pair[target] = pd.to_numeric(pair[target], errors="coerce")
+            valid = pair.dropna()
+            if len(valid) > 5 and valid[feat].nunique() > 1 and valid[target].nunique() > 1:
                 corr_rows.append({"feature": feat, "target": target, "corr": valid[feat].corr(valid[target]), "n": len(valid)})
-    corr_df = pd.DataFrame(corr_rows).sort_values("corr", key=lambda s: s.abs(), ascending=False)
+    corr_df = pd.DataFrame(corr_rows)
+    if len(corr_df):
+        corr_df = corr_df.sort_values("corr", key=lambda s: s.abs(), ascending=False)
     corr_csv = os.path.join(args.output_dir, "cot_complexity_correlations.csv")
     corr_df.to_csv(corr_csv, index=False)
     logger.info(f"saved {corr_csv}")
     logger.info("top correlations:\n" + str(corr_df.head(20)))
 
     # Complexity bins.
-    if "complexity_score" in out_df.columns:
-        out_df["complexity_bin"] = pd.qcut(out_df["complexity_score"].rank(method="first"), q=4, labels=["low", "mid", "high", "very_high"])
-        agg_cols = [c for c in ["pdm_score", "cot_traj_consistency", "n_objects", "gt_curvature_proxy", "gt_speed_var"] if c in out_df.columns]
-        summary = out_df.groupby("complexity_bin")[agg_cols].mean().reset_index()
-        summary["count"] = out_df.groupby("complexity_bin").size().values
-        summary_csv = os.path.join(args.output_dir, "cot_consistency_by_complexity.csv")
-        summary.to_csv(summary_csv, index=False)
-        logger.info(f"saved {summary_csv}")
-        logger.info("complexity summary:\n" + str(summary))
+    if "complexity_score" in out_df.columns and len(out_df) >= 4:
+        try:
+            out_df["complexity_bin"] = pd.qcut(out_df["complexity_score"].rank(method="first"), q=4, labels=["low", "mid", "high", "very_high"])
+            agg_cols = [c for c in ["pdm_score", "cot_traj_consistency", "n_objects", "gt_curvature_proxy", "gt_speed_var"] if c in out_df.columns]
+            summary = out_df.groupby("complexity_bin", observed=False)[agg_cols].mean().reset_index()
+            summary["count"] = out_df.groupby("complexity_bin", observed=False).size().values
+            summary_csv = os.path.join(args.output_dir, "cot_consistency_by_complexity.csv")
+            summary.to_csv(summary_csv, index=False)
+            logger.info(f"saved {summary_csv}")
+            logger.info("complexity summary:\n" + str(summary))
+        except Exception as e:
+            logger.warning(f"complexity bin summary skipped: {e}")
 
 
 if __name__ == "__main__":
