@@ -74,6 +74,57 @@ def predicted_traj_from_row(row: pd.Series) -> Optional[np.ndarray]:
     return np.asarray(list(zip(xs[:n], ys[:n], hs[:n])), dtype=float)
 
 
+def resolve_csv_path(path_str: Optional[str], data_root: Optional[Path], filename: str, required: bool) -> Optional[str]:
+    """Resolve a CSV path; if missing, auto-pick latest matching file under data_root/exp."""
+    if not path_str:
+        path = None
+    else:
+        path = Path(path_str).expanduser()
+        if path.exists():
+            return str(path.resolve())
+        print(f"[continuous-viz][warn] CSV not found: {path}", flush=True)
+
+    search_roots: List[Path] = []
+    if data_root is not None:
+        search_roots.append(data_root / "exp")
+        search_roots.append(data_root)
+    if path is not None:
+        # Also search near the user-provided path, useful when only timestamp dir is wrong.
+        search_roots.extend(list(path.parents[:6]))
+
+    candidates: List[Path] = []
+    seen = set()
+    for root in search_roots:
+        try:
+            root = root.expanduser().resolve()
+        except Exception:
+            continue
+        if not root.exists() or root in seen:
+            continue
+        seen.add(root)
+        try:
+            candidates.extend(root.rglob(filename))
+        except Exception:
+            pass
+
+    candidates = [p for p in candidates if p.is_file()]
+    if candidates:
+        candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+        chosen = candidates[0].resolve()
+        print(f"[continuous-viz][auto] using latest {filename}: {chosen}", flush=True)
+        if len(candidates) > 1:
+            print("[continuous-viz][auto] other recent candidates:", flush=True)
+            for cand in candidates[1:5]:
+                print(f"  {cand.resolve()}", flush=True)
+        return str(chosen)
+
+    if required:
+        roots = ", ".join(str(r) for r in search_roots[:6])
+        raise FileNotFoundError(f"Cannot find required {filename}. Searched near: {roots}")
+    print(f"[continuous-viz][warn] optional {filename} not found; continuing without it", flush=True)
+    return None
+
+
 def require_time_and_log_columns(df: pd.DataFrame) -> None:
     missing = [c for c in ["token", "log_name", "start_time"] if c not in df.columns]
     if missing:
@@ -289,6 +340,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     data_root = infer_data_root_from_scores(args.scores_csv)
+    args.scores_csv = resolve_csv_path(args.scores_csv, data_root, "alpamayo_pdm_scores_merged.csv", required=True)
+    # Re-infer after auto-discovery, because the user-provided missing path may be stale.
+    data_root = infer_data_root_from_scores(args.scores_csv)
+    args.analysis_csv = resolve_csv_path(args.analysis_csv, data_root, "cot_failure_pattern_enriched.csv", required=False)
     if args.metric_cache_path is None and data_root is not None:
         args.metric_cache_path = str(data_root / "metric_cache")
     if args.navsim_log_path is None and data_root is not None:
@@ -296,6 +351,8 @@ def main():
     if args.sensor_blobs_path is None and data_root is not None:
         args.sensor_blobs_path = str(data_root / "sensor_blobs" / "mini")
 
+    if args.scores_csv is None:
+        raise FileNotFoundError("scores_csv could not be resolved")
     df = load_and_merge(args.scores_csv, args.analysis_csv)
     df = add_basic_ranking_columns(df)
     require_time_and_log_columns(df)
