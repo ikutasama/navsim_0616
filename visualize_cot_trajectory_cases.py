@@ -7,7 +7,11 @@ Typical usage:
     --analysis_csv /path/to/cot_failure_pattern_enriched.csv \
     --metric_cache_path $OPENSCENE_DATA_ROOT/metric_cache \
     --output_dir $OPENSCENE_DATA_ROOT/exp/visualizations/weak_cases \
-    --select weakest --top_k 30 --make_gif
+    --select weakest --top_k 30 --make_case_gifs
+
+Important: each NavSim token is one planning scene/current timestep, not a full continuous rollout.
+The per-case GIF animates the 4-second predicted/GT future trajectory being revealed step-by-step.
+Different scenes are NOT stitched into one GIF.
 
 If --analysis_csv is omitted, the script still plots CoT + pred trajectory + PDM metrics from scores_csv.
 If --metric_cache_path is omitted or unavailable, GT trajectory / object context are skipped.
@@ -19,6 +23,7 @@ import math
 import os
 import re
 import textwrap
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -411,23 +416,138 @@ def select_cases(df: pd.DataFrame, mode: str, top_k: int, tokens: Optional[List[
     return df.sort_values("weak_case_score", ascending=False).head(top_k).copy()
 
 
-def make_gif(image_paths: List[Path], gif_path: Path, duration_ms: int):
-    if not image_paths:
+def compute_plot_bounds(pred: Optional[np.ndarray], gt: Optional[np.ndarray], objects: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
+    pts = [[0.0, 0.0]]
+    if pred is not None and len(pred):
+        pts.extend(pred[:, :2].tolist())
+    if gt is not None and len(gt):
+        pts.extend(gt[:, :2].tolist())
+    for obj in objects[:80]:
+        pts.append([obj.get("x", 0.0), obj.get("y", 0.0)])
+    pts_arr = np.asarray(pts, dtype=float)
+    finite = pts_arr[np.isfinite(pts_arr).all(axis=1)]
+    if len(finite):
+        xmin, ymin = finite.min(axis=0)
+        xmax, ymax = finite.max(axis=0)
+        return min(-10, xmin - 8), max(30, xmax + 8), min(-20, ymin - 8), max(20, ymax + 8)
+    return -10, 30, -20, 20
+
+
+def draw_static_objects(ax, objects: List[Dict[str, Any]]):
+    if not objects:
         return
+    patches = []
+    colors = []
+    for obj in objects:
+        x, y = obj.get("x", 0.0), obj.get("y", 0.0)
+        if abs(x) <= 80 and abs(y) <= 50:
+            patches.append(object_patch(obj))
+            typ = obj.get("type", "")
+            if "ped" in typ or "bicycle" in typ or "cycl" in typ:
+                colors.append("tab:red")
+            elif "vehicle" in typ:
+                colors.append("tab:orange")
+            else:
+                colors.append("tab:gray")
+    if patches:
+        pc = PatchCollection(patches, facecolor=colors, edgecolor="none", alpha=0.25, label="objects@now")
+        ax.add_collection(pc)
+
+
+def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: Optional[str] = None, duration_ms: int = 450):
+    """Create one GIF for one NavSim planning scene.
+
+    NavSim evaluation output has one 4s future trajectory per token. This GIF does not stitch
+    different tokens; it reveals this single token's predicted and GT future trajectory step-by-step.
+    """
     try:
         from PIL import Image
-        frames = []
-        for p in image_paths:
-            img = Image.open(p).convert("RGB")
-            # Keep GIF size manageable.
-            max_w = 1200
-            if img.width > max_w:
-                new_h = int(img.height * max_w / img.width)
-                img = img.resize((max_w, new_h))
-            frames.append(img)
-        frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
     except Exception as e:
-        print(f"[warn] failed to create GIF {gif_path}: {e}", flush=True)
+        print(f"[warn] PIL/Pillow is required for GIF creation: {e}", flush=True)
+        return
+
+    token = safe_str(row.get("token", ""))
+    xs = parse_json_list(row.get("pred_traj_x", "[]"))
+    ys = parse_json_list(row.get("pred_traj_y", "[]"))
+    hs = parse_json_list(row.get("pred_traj_heading", "[]"))
+    pred = np.asarray(list(zip(xs, ys, hs if len(hs) == len(xs) else [0.0] * len(xs))), dtype=float) if xs and ys else None
+
+    metric_cache = load_metric_cache(metric_cache_path, token) if metric_cache_path else None
+    gt, objects = extract_gt_traj_and_objects(metric_cache)
+    n_pred = len(pred) if pred is not None else 0
+    n_gt = len(gt) if gt is not None else 0
+    n_steps = max(n_pred, n_gt, 1)
+    xmin, xmax, ymin, ymax = compute_plot_bounds(pred, gt, objects)
+
+    cot = wrap_text(safe_str(row.get("cot", "")), width=58, max_lines=11)
+    meta = wrap_text(safe_str(row.get("meta_action", "")), width=58, max_lines=3)
+    answer = wrap_text(safe_str(row.get("answer", "")), width=58, max_lines=3)
+    pdm = row.get("pdm_score", np.nan)
+    cons = row.get("cot_traj_consistency", np.nan)
+    weak = row.get("weak_case_score", np.nan)
+
+    frames = []
+    for step in range(n_steps + 1):
+        fig = plt.figure(figsize=(14, 7.5), dpi=120)
+        gs = fig.add_gridspec(1, 2, width_ratios=[0.95, 1.45], wspace=0.22)
+        ax_text = fig.add_subplot(gs[0, 0])
+        ax = fig.add_subplot(gs[0, 1])
+        t_sec = min(step, 8) * 0.5
+        fig.suptitle(f"Scene #{idx:03d} token={token[:18]}  t=+{t_sec:.1f}s  PDM={pdm:.3f}  CoT-Traj={cons:.3f}", fontsize=13, fontweight="bold")
+
+        ax_text.axis("off")
+        text_lines = [
+            "META_ACTION", meta, "",
+            "COT", cot, "",
+        ]
+        if answer and answer != "<empty>":
+            text_lines += ["ANSWER", answer, ""]
+        text_lines += [
+            "QUANT", f"  pdm_score: {pdm:.4f}", f"  cot_traj_consistency: {cons:.4f}", f"  weak_case_score: {weak:.4f}",
+        ]
+        for flag in ["mentions_object_any", "mentions_other_agent_intent", "mentions_risk_or_conflict", "mentions_spatial_relation"]:
+            if flag in row.index:
+                text_lines.append(f"  {flag}: {bool_mark(row.get(flag))}")
+        ax_text.text(0.0, 1.0, "\n".join(text_lines), va="top", ha="left", fontsize=8.5, family="monospace")
+
+        ax.set_title("Single-scene 4s future trajectory reveal")
+        ax.axhline(0, color="0.85", lw=1)
+        ax.axvline(0, color="0.85", lw=1)
+        ax.scatter([0], [0], c="black", s=70, marker="*", label="ego@now", zorder=5)
+        draw_static_objects(ax, objects)
+
+        if gt is not None and len(gt) >= 2:
+            ax.plot(gt[:, 0], gt[:, 1], "--", color="tab:green", lw=1.5, alpha=0.25, label="GT full")
+            k = min(step, len(gt))
+            if k > 0:
+                ax.plot(gt[:k, 0], gt[:k, 1], "-o", color="tab:green", lw=3, ms=5, label="GT revealed")
+                ax.scatter([gt[k - 1, 0]], [gt[k - 1, 1]], c="tab:green", s=80, marker="x", zorder=6)
+        if pred is not None and len(pred) >= 2:
+            ax.plot(pred[:, 0], pred[:, 1], "--", color="tab:blue", lw=1.5, alpha=0.25, label="pred full")
+            k = min(step, len(pred))
+            if k > 0:
+                ax.plot(pred[:k, 0], pred[:k, 1], "-o", color="tab:blue", lw=3, ms=5, label="pred revealed")
+                ax.scatter([pred[k - 1, 0]], [pred[k - 1, 1]], c="tab:blue", s=80, marker="x", zorder=6)
+
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x forward / meters")
+        ax.set_ylabel("y left / meters")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+        frames.append(img)
+
+    # Hold the final frame a bit longer.
+    if frames:
+        frames.extend([frames[-1]] * 3)
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
 
 
 def main():
@@ -439,8 +559,9 @@ def main():
     parser.add_argument("--select", choices=["weakest", "low_pdm", "inconsistent", "all"], default="weakest")
     parser.add_argument("--top_k", type=int, default=30)
     parser.add_argument("--tokens", nargs="*", default=None, help="specific tokens to visualize; overrides --select")
-    parser.add_argument("--make_gif", action="store_true")
-    parser.add_argument("--gif_duration_ms", type=int, default=1800)
+    parser.add_argument("--make_case_gifs", action="store_true", help="Create one trajectory-reveal GIF per selected scene/token")
+    parser.add_argument("--make_gif", action="store_true", help="Backward-compatible alias for --make_case_gifs; creates per-scene GIFs, not a multi-scene montage")
+    parser.add_argument("--gif_duration_ms", type=int, default=450)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -458,6 +579,8 @@ def main():
     chosen.to_csv(selected_csv, index=False)
 
     image_paths: List[Path] = []
+    gif_paths: List[Path] = []
+    make_case_gifs_flag = args.make_case_gifs or args.make_gif
     for i, (_, row) in enumerate(chosen.iterrows(), start=1):
         token = safe_str(row.get("token", f"case{i}"))
         safe_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", token)[:80]
@@ -465,14 +588,16 @@ def main():
         print(f"[viz] {i}/{len(chosen)} token={token} -> {out_path}", flush=True)
         plot_case(row, i, out_path, metric_cache_path=args.metric_cache_path)
         image_paths.append(out_path)
-
-    if args.make_gif:
-        gif_path = output_dir / f"{args.select}_top{len(image_paths)}.gif"
-        make_gif(image_paths, gif_path, args.gif_duration_ms)
-        print(f"[viz] gif: {gif_path}", flush=True)
+        if make_case_gifs_flag:
+            gif_path = output_dir / f"case_{i:03d}_{safe_token}.gif"
+            print(f"[viz] {i}/{len(chosen)} token={token} -> {gif_path}", flush=True)
+            make_case_gif(row, i, gif_path, metric_cache_path=args.metric_cache_path, duration_ms=args.gif_duration_ms)
+            gif_paths.append(gif_path)
 
     print(f"[viz] selected_csv: {selected_csv}", flush=True)
     print(f"[viz] png_dir: {output_dir}", flush=True)
+    if gif_paths:
+        print(f"[viz] per-scene_gifs: {len(gif_paths)} files in {output_dir}", flush=True)
 
 
 if __name__ == "__main__":
