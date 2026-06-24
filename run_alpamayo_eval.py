@@ -23,6 +23,18 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def infer_data_root() -> Path:
+    env_root = os.environ.get("OPENSCENE_DATA_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    repo_dir = Path(__file__).resolve().parent
+    candidates = [repo_dir / "navsim" / "navsim_dataset", repo_dir / "navsim_dataset", repo_dir / "dataset"]
+    for cand in candidates:
+        if (cand / "navsim_logs").exists() or (cand / "metric_cache").exists() or (cand / "sensor_blobs").exists():
+            return cand.resolve()
+    return (repo_dir / "navsim" / "navsim_dataset").resolve()
+
+
 def run_eval(
     navsim_log_path: str,
     sensor_blobs_path: str,
@@ -210,12 +222,13 @@ def run_eval(
 
 
 def main():
+    data_root = infer_data_root()
     parser = argparse.ArgumentParser(description="Alpamayo1.5 NavSim eval with multi-GPU sharding")
-    parser.add_argument("--navsim_log_path", default=os.environ.get("OPENSCENE_DATA_ROOT", "") + "/navsim_logs/mini")
-    parser.add_argument("--sensor_blobs_path", default=os.environ.get("OPENSCENE_DATA_ROOT", "") + "/sensor_blobs/mini")
-    parser.add_argument("--metric_cache_path", default=os.environ.get("OPENSCENE_DATA_ROOT", "") + "/metric_cache")
+    parser.add_argument("--navsim_log_path", default=str(data_root / "navsim_logs" / "mini"))
+    parser.add_argument("--sensor_blobs_path", default=str(data_root / "sensor_blobs" / "mini"))
+    parser.add_argument("--metric_cache_path", default=str(data_root / "metric_cache"))
     parser.add_argument("--model_path", default="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B")
-    parser.add_argument("--output_dir", default=os.environ.get("OPENSCENE_DATA_ROOT", "") + "/exp/eval_results")
+    parser.add_argument("--output_dir", default=str(data_root / "exp" / "eval_results"))
     parser.add_argument("--max_eval_tokens", type=int, default=0, help="0=全部；>0只评估前N个可评估token")
     parser.add_argument("--shard_id", type=int, default=0, help="当前分片编号，0..total_shards-1")
     parser.add_argument("--total_shards", type=int, default=1, help="总分片数；4卡就设4")

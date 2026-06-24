@@ -9,6 +9,7 @@ Notes:
 - Each child process sees exactly one physical GPU via CUDA_VISIBLE_DEVICES=<gpu>.
 - Therefore each child uses --device cuda:0 internally.
 - Results are written into a fresh run directory to avoid merging stale CSV files.
+- If OPENSCENE_DATA_ROOT is not exported, the launcher auto-detects ./navsim/navsim_dataset.
 """
 
 import argparse
@@ -19,31 +20,70 @@ from datetime import datetime
 from pathlib import Path
 
 
-def default_from_env(name: str, suffix: str = "", fallback: str = "") -> str:
-    base = os.environ.get(name, "")
-    if base:
-        return base.rstrip("/") + suffix
-    return fallback
+def infer_data_root(repo_dir: Path) -> Path:
+    env_root = os.environ.get("OPENSCENE_DATA_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    candidates = [
+        repo_dir / "navsim" / "navsim_dataset",
+        repo_dir / "navsim_dataset",
+        repo_dir / "dataset",
+    ]
+    for cand in candidates:
+        if (cand / "navsim_logs").exists() or (cand / "metric_cache").exists() or (cand / "sensor_blobs").exists():
+            return cand.resolve()
+
+    # Keep a sensible default for path printing; later validation will fail clearly.
+    return (repo_dir / "navsim" / "navsim_dataset").resolve()
+
+
+def tail_file(path: Path, n_lines: int = 80) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-n_lines:])
+    except Exception as e:
+        return f"<cannot read log {path}: {e}>"
+
+
+def require_path(path: Path, name: str):
+    if not path.exists():
+        raise FileNotFoundError(f"{name} does not exist: {path}")
 
 
 def main():
+    repo_dir = Path(__file__).resolve().parent
+    data_root = infer_data_root(repo_dir)
+
     parser = argparse.ArgumentParser(description="Run Alpamayo NavSim eval on N GPUs and merge shard CSVs")
     parser.add_argument("--gpus", nargs="+", required=True, help="Physical GPU ids, e.g. --gpus 0 1 2 3")
-    parser.add_argument("--navsim_log_path", default=default_from_env("OPENSCENE_DATA_ROOT", "/navsim_logs/mini"))
-    parser.add_argument("--sensor_blobs_path", default=default_from_env("OPENSCENE_DATA_ROOT", "/sensor_blobs/mini"))
-    parser.add_argument("--metric_cache_path", default=default_from_env("OPENSCENE_DATA_ROOT", "/metric_cache"))
+    parser.add_argument("--navsim_log_path", default=str(data_root / "navsim_logs" / "mini"))
+    parser.add_argument("--sensor_blobs_path", default=str(data_root / "sensor_blobs" / "mini"))
+    parser.add_argument("--metric_cache_path", default=str(data_root / "metric_cache"))
     parser.add_argument("--model_path", default="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B")
-    parser.add_argument("--output_root", default=default_from_env("OPENSCENE_DATA_ROOT", "/exp/eval_results", "./eval_results"))
+    parser.add_argument("--output_root", default=str(data_root / "exp" / "eval_results"))
     parser.add_argument("--run_id", default=None, help="Run id directory name. Default: timestamped alpamayo_eval_YYYYmmdd_HHMMSS")
     parser.add_argument("--max_eval_tokens", type=int, default=0, help="0=all tokens; >0 only first N tokens before sharding")
     parser.add_argument("--save_cot_json", action="store_true")
     parser.add_argument("--merged_name", default="alpamayo_pdm_scores_merged", help="Merged CSV basename without .csv")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for child processes")
+    parser.add_argument("--no_validate_paths", action="store_true", help="Skip preflight existence checks")
     args = parser.parse_args()
 
-    repo_dir = Path(__file__).resolve().parent
+    navsim_log_path = Path(args.navsim_log_path).expanduser().resolve()
+    sensor_blobs_path = Path(args.sensor_blobs_path).expanduser().resolve()
+    metric_cache_path = Path(args.metric_cache_path).expanduser().resolve()
+    model_path = Path(args.model_path).expanduser().resolve()
+    output_root = Path(args.output_root).expanduser().resolve()
+
+    if not args.no_validate_paths:
+        require_path(navsim_log_path, "navsim_log_path")
+        require_path(sensor_blobs_path, "sensor_blobs_path")
+        require_path(metric_cache_path, "metric_cache_path")
+        require_path(model_path, "model_path")
+
     run_id = args.run_id or datetime.now().strftime("alpamayo_eval_%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_root).expanduser().resolve() / run_id
+    output_dir = output_root / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
     gpus = [str(g) for g in args.gpus]
@@ -51,6 +91,12 @@ def main():
     if total_shards < 1:
         raise ValueError("Need at least one GPU")
 
+    print(f"[launcher] repo_dir: {repo_dir}", flush=True)
+    print(f"[launcher] data_root: {data_root}", flush=True)
+    print(f"[launcher] navsim_log_path: {navsim_log_path}", flush=True)
+    print(f"[launcher] sensor_blobs_path: {sensor_blobs_path}", flush=True)
+    print(f"[launcher] metric_cache_path: {metric_cache_path}", flush=True)
+    print(f"[launcher] model_path: {model_path}", flush=True)
     print(f"[launcher] GPUs: {gpus}", flush=True)
     print(f"[launcher] total_shards: {total_shards}", flush=True)
     print(f"[launcher] output_dir: {output_dir}", flush=True)
@@ -59,13 +105,16 @@ def main():
     for shard_id, gpu in enumerate(gpus):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
+        env.setdefault("OPENSCENE_DATA_ROOT", str(data_root))
+        env.setdefault("NAVSIM_DEVKIT_ROOT", str(repo_dir / "navsim"))
+        env.setdefault("NAVSIM_EXP_ROOT", str(data_root / "exp"))
         cmd = [
             args.python,
             str(repo_dir / "run_alpamayo_eval.py"),
-            "--navsim_log_path", args.navsim_log_path,
-            "--sensor_blobs_path", args.sensor_blobs_path,
-            "--metric_cache_path", args.metric_cache_path,
-            "--model_path", args.model_path,
+            "--navsim_log_path", str(navsim_log_path),
+            "--sensor_blobs_path", str(sensor_blobs_path),
+            "--metric_cache_path", str(metric_cache_path),
+            "--model_path", str(model_path),
             "--output_dir", str(output_dir),
             "--max_eval_tokens", str(args.max_eval_tokens),
             "--shard_id", str(shard_id),
@@ -95,6 +144,8 @@ def main():
         print("[launcher] At least one shard failed; not merging. Failed shards:", flush=True)
         for shard_id, gpu, ret, log_path in failed:
             print(f"  shard={shard_id} gpu={gpu} exit={ret} log={log_path}", flush=True)
+            print(f"\n[launcher] tail -80 {log_path}:", flush=True)
+            print(tail_file(log_path, 80), flush=True)
         sys.exit(1)
 
     merge_cmd = [
@@ -107,7 +158,7 @@ def main():
     subprocess.run(merge_cmd, cwd=str(repo_dir), check=True)
 
     merged_csv = output_dir / f"{args.merged_name}.csv"
-    latest_link = Path(args.output_root).expanduser().resolve() / f"{args.merged_name}_latest.csv"
+    latest_link = output_root / f"{args.merged_name}_latest.csv"
     try:
         if latest_link.exists() or latest_link.is_symlink():
             latest_link.unlink()
