@@ -4,13 +4,13 @@ One-command full Alpamayo1.5 NavSim pipeline:
 2) merge shard CSVs
 3) analyze CoT-trajectory consistency
 4) analyze CoT failure patterns
-5) optionally visualize top weak cases as PNG and per-scene GIFs
+5) optionally visualize top weak cases as PNG, single-token GIFs, and/or continuous NAVSIM log GIFs
 
 Example full mini evaluation on GPUs 1-4:
   python run_full_alpamayo_navsim_pipeline.py --gpus 1 2 3 4
 
-Smoke test on 20 cases with visualization:
-  python run_full_alpamayo_navsim_pipeline.py --gpus 1 2 3 4 --max_eval_tokens 20 --visualize_top_k 10 --make_case_gifs
+Smoke test on 20 cases with continuous scene visualization:
+  python run_full_alpamayo_navsim_pipeline.py --gpus 1 2 3 4 --max_eval_tokens 20 --visualize_top_k 10 --make_continuous_scene_gifs
 
 Notes:
 - max_eval_tokens=0 means all evaluable tokens.
@@ -100,8 +100,11 @@ def main():
     parser.add_argument("--output_root", default=None, help="Default: <data_root>/exp/full_pipeline")
     parser.add_argument("--max_eval_tokens", type=int, default=0, help="0=all evaluable tokens; >0 smoke-test first N tokens")
     parser.add_argument("--save_cot_json", action="store_true")
-    parser.add_argument("--visualize_top_k", type=int, default=0, help="0 disables visualization; >0 creates top-K weak PNGs")
-    parser.add_argument("--make_case_gifs", action="store_true", help="When visualizing, also create one GIF per scene")
+    parser.add_argument("--visualize_top_k", type=int, default=0, help="0 disables visualization; >0 creates top-K weak PNGs / GIFs")
+    parser.add_argument("--make_case_gifs", action="store_true", help="When visualizing, also create old single-token trajectory-reveal GIFs")
+    parser.add_argument("--make_continuous_scene_gifs", action="store_true", help="Create continuous same-log NAVSIM GIFs: changing front camera + per-timestep pred/GT futures")
+    parser.add_argument("--continuous_frames", type=int, default=12, help="consecutive NAVSIM tokens per continuous GIF")
+    parser.add_argument("--continuous_pre_frames", type=int, default=3, help="frames before anchor token in each continuous GIF")
     parser.add_argument("--select_visualization", choices=["weakest", "low_pdm", "inconsistent", "all"], default="weakest")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip_eval", action="store_true", help="Reuse --scores_csv and run analysis only")
@@ -226,6 +229,23 @@ def main():
             viz_cmd.append("--make_case_gifs")
         run_cmd(viz_cmd, cwd=repo_dir, log_path=logs_dir / "04_visualization.log", env=env, keep_log=args.keep_logs)
 
+        if args.make_continuous_scene_gifs:
+            continuous_dir = run_dir / "visualizations" / f"{args.select_visualization}_continuous"
+            continuous_cmd = [
+                args.python, str(repo_dir / "visualize_continuous_navsim_scene.py"),
+                "--scores_csv", str(merged_csv),
+                "--analysis_csv", str(failure_csv),
+                "--metric_cache_path", str(metric_cache_path),
+                "--navsim_log_path", str(data_root / "navsim_logs" / "mini"),
+                "--sensor_blobs_path", str(data_root / "sensor_blobs" / "mini"),
+                "--output_dir", str(continuous_dir),
+                "--select", args.select_visualization,
+                "--top_k", str(args.visualize_top_k),
+                "--frames", str(args.continuous_frames),
+                "--pre_frames", str(args.continuous_pre_frames),
+            ]
+            run_cmd(continuous_cmd, cwd=repo_dir, log_path=logs_dir / "05_continuous_visualization.log", env=env, keep_log=args.keep_logs)
+
     # Summary.
     print("\n[pipeline] ===== DONE =====", flush=True)
     print(f"[pipeline] run_dir: {run_dir}", flush=True)
@@ -236,6 +256,8 @@ def main():
     print(f"[pipeline] top_cases_txt: {failure_dir / 'top_weak_cot_traj_cases.txt'}", flush=True)
     if args.visualize_top_k > 0:
         print(f"[pipeline] visualization_dir: {viz_dir}", flush=True)
+        if args.make_continuous_scene_gifs:
+            print(f"[pipeline] continuous_visualization_dir: {run_dir / 'visualizations' / (args.select_visualization + '_continuous')}", flush=True)
     if args.keep_logs:
         print(f"[pipeline] logs_dir: {logs_dir}", flush=True)
     else:
