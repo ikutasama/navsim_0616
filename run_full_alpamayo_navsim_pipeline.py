@@ -38,10 +38,9 @@ def infer_data_root(repo_dir: Path) -> Path:
     return (repo_dir / "navsim" / "navsim_dataset").resolve()
 
 
-def run_cmd(cmd: List[str], cwd: Path, log_path: Path, env: Optional[dict] = None):
+def run_cmd(cmd: List[str], cwd: Path, log_path: Path, env: Optional[dict] = None, keep_log: bool = False):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[pipeline] RUN: {' '.join(cmd)}", flush=True)
-    print(f"[pipeline] LOG: {log_path}", flush=True)
     with open(log_path, "w", encoding="utf-8") as f:
         proc = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=f, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
@@ -53,12 +52,39 @@ def run_cmd(cmd: List[str], cwd: Path, log_path: Path, env: Optional[dict] = Non
         except Exception as e:
             print(f"<cannot read log: {e}>", flush=True)
         raise SystemExit(proc.returncode)
-    print(f"[pipeline] OK: {log_path}", flush=True)
+    if keep_log:
+        print(f"[pipeline] OK log kept: {log_path}", flush=True)
+    else:
+        try:
+            log_path.unlink()
+        except Exception:
+            pass
+        print(f"[pipeline] OK", flush=True)
 
 
 def require_path(path: Path, name: str):
     if not path.exists():
         raise FileNotFoundError(f"{name} does not exist: {path}")
+
+
+def cleanup_eval_intermediates(merged_csv: Path):
+    """Keep human-facing merged CSV only; remove shard logs and per-shard CSVs."""
+    eval_dir = merged_csv.parent
+    patterns = [
+        "shard*_gpu*.log",
+        "alpamayo_pdm_scores_*_shard*.csv",
+        "alpamayo_cot_outputs_*_shard*.json",
+    ]
+    removed = 0
+    for pat in patterns:
+        for p in eval_dir.glob(pat):
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        print(f"[pipeline] cleaned {removed} shard/log intermediate files from {eval_dir}", flush=True)
 
 
 def main():
@@ -80,6 +106,8 @@ def main():
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--skip_eval", action="store_true", help="Reuse --scores_csv and run analysis only")
     parser.add_argument("--scores_csv", default=None, help="Required with --skip_eval; otherwise optional existing merged CSV")
+    parser.add_argument("--keep_logs", action="store_true", help="Keep step logs after successful completion; failure logs are always kept/printed")
+    parser.add_argument("--keep_shards", action="store_true", help="Keep per-shard CSV/log files after merged CSV is produced")
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -136,7 +164,7 @@ def main():
         ]
         if args.save_cot_json:
             eval_cmd.append("--save_cot_json")
-        run_cmd(eval_cmd, cwd=repo_dir, log_path=logs_dir / "01_eval.log", env=env)
+        run_cmd(eval_cmd, cwd=repo_dir, log_path=logs_dir / "01_eval.log", env=env, keep_log=args.keep_logs)
 
         # run_alpamayo_eval_multi_gpu.py writes one timestamped subdir under eval_output_root.
         candidates = sorted(eval_output_root.glob("*/alpamayo_pdm_scores_merged.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -147,6 +175,8 @@ def main():
             raise FileNotFoundError(f"Cannot find merged CSV under {eval_output_root}")
         merged_csv = candidates[0].resolve()
         print(f"[pipeline] merged_csv: {merged_csv}", flush=True)
+        if not args.keep_shards:
+            cleanup_eval_intermediates(merged_csv)
 
     # Copy/link the merged CSV into run_dir for discoverability.
     canonical_scores = run_dir / "alpamayo_pdm_scores_merged.csv"
@@ -165,7 +195,7 @@ def main():
         "--metric_cache_path", str(metric_cache_path),
         "--output_dir", str(cot_analysis_dir),
     ]
-    run_cmd(consistency_cmd, cwd=repo_dir, log_path=logs_dir / "02_cot_consistency.log", env=env)
+    run_cmd(consistency_cmd, cwd=repo_dir, log_path=logs_dir / "02_cot_consistency.log", env=env, keep_log=args.keep_logs)
     consistency_csv = cot_analysis_dir / "cot_consistency_analysis.csv"
     require_path(consistency_csv, "cot_consistency_analysis.csv")
 
@@ -175,7 +205,7 @@ def main():
         "--analysis_csv", str(consistency_csv),
         "--output_dir", str(failure_dir),
     ]
-    run_cmd(failure_cmd, cwd=repo_dir, log_path=logs_dir / "03_cot_failure_patterns.log", env=env)
+    run_cmd(failure_cmd, cwd=repo_dir, log_path=logs_dir / "03_cot_failure_patterns.log", env=env, keep_log=args.keep_logs)
     failure_csv = failure_dir / "cot_failure_pattern_enriched.csv"
     require_path(failure_csv, "cot_failure_pattern_enriched.csv")
 
@@ -186,13 +216,15 @@ def main():
             "--scores_csv", str(merged_csv),
             "--analysis_csv", str(failure_csv),
             "--metric_cache_path", str(metric_cache_path),
+            "--navsim_log_path", str(data_root / "navsim_logs" / "mini"),
+            "--sensor_blobs_path", str(data_root / "sensor_blobs" / "mini"),
             "--output_dir", str(viz_dir),
             "--select", args.select_visualization,
             "--top_k", str(args.visualize_top_k),
         ]
         if args.make_case_gifs:
             viz_cmd.append("--make_case_gifs")
-        run_cmd(viz_cmd, cwd=repo_dir, log_path=logs_dir / "04_visualization.log", env=env)
+        run_cmd(viz_cmd, cwd=repo_dir, log_path=logs_dir / "04_visualization.log", env=env, keep_log=args.keep_logs)
 
     # Summary.
     print("\n[pipeline] ===== DONE =====", flush=True)
@@ -204,7 +236,14 @@ def main():
     print(f"[pipeline] top_cases_txt: {failure_dir / 'top_weak_cot_traj_cases.txt'}", flush=True)
     if args.visualize_top_k > 0:
         print(f"[pipeline] visualization_dir: {viz_dir}", flush=True)
-    print(f"[pipeline] logs_dir: {logs_dir}", flush=True)
+    if args.keep_logs:
+        print(f"[pipeline] logs_dir: {logs_dir}", flush=True)
+    else:
+        try:
+            if logs_dir.exists() and not any(logs_dir.iterdir()):
+                logs_dir.rmdir()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

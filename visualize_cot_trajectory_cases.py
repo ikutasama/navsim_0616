@@ -38,6 +38,9 @@ from matplotlib.collections import PatchCollection
 from matplotlib.patches import Rectangle
 
 
+_SCENE_LOADER = None
+
+
 PDM_METRICS = [
     "pdm_score",
     "no_at_fault_collisions",
@@ -126,11 +129,68 @@ def load_metric_cache(metric_cache_path: Optional[str], token: str):
         return None
 
 
-def extract_gt_traj_and_objects(metric_cache) -> Tuple[Optional[np.ndarray], List[Dict[str, Any]]]:
+def infer_data_root_from_scores(scores_csv: Optional[str] = None) -> Optional[Path]:
+    env_root = os.environ.get("OPENSCENE_DATA_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    if scores_csv:
+        p = Path(scores_csv).expanduser().resolve()
+        for parent in [p] + list(p.parents):
+            if (parent / "navsim_logs").exists() and (parent / "sensor_blobs").exists():
+                return parent
+    cwd = Path.cwd()
+    for cand in [cwd / "navsim" / "navsim_dataset", cwd / "navsim_dataset", cwd / "dataset"]:
+        if (cand / "navsim_logs").exists() and (cand / "sensor_blobs").exists():
+            return cand.resolve()
+    return None
+
+
+def get_front_camera_image(token: str, navsim_log_path: Optional[str], sensor_blobs_path: Optional[str]):
+    """Load current front camera image for a token using SceneLoader.
+
+    Returns RGB uint8 image or None. Uses one cached SceneLoader per process.
+    """
+    global _SCENE_LOADER
+    if not navsim_log_path or not sensor_blobs_path:
+        return None
+    try:
+        from navsim.common.dataclasses import SceneFilter, SensorConfig
+        from navsim.common.dataloader import SceneLoader
+        if _SCENE_LOADER is None:
+            sensor_config = SensorConfig(
+                cam_f0=[3],
+                cam_l0=False, cam_l1=False, cam_l2=False,
+                cam_r0=False, cam_r1=False, cam_r2=False,
+                cam_b0=False,
+                lidar_pc=False,
+            )
+            scene_filter = SceneFilter(num_history_frames=4, num_future_frames=10)
+            _SCENE_LOADER = SceneLoader(
+                data_path=Path(navsim_log_path),
+                synthetic_sensor_path=Path(sensor_blobs_path),
+                original_sensor_path=Path(sensor_blobs_path),
+                synthetic_scenes_path=Path(navsim_log_path),
+                scene_filter=scene_filter,
+                sensor_config=sensor_config,
+            )
+        if token not in _SCENE_LOADER.tokens:
+            return None
+        agent_input = _SCENE_LOADER.get_agent_input_from_token(token)
+        if not agent_input.cameras:
+            return None
+        img = agent_input.cameras[-1].cam_f0.image
+        return img
+    except Exception as e:
+        print(f"[warn] front camera load failed for token={token}: {e}", flush=True)
+        return None
+
+
+def extract_gt_traj_and_objects(metric_cache) -> Tuple[Optional[np.ndarray], List[Dict[str, Any]], List[Dict[str, Any]]]:
     gt = None
     objects: List[Dict[str, Any]] = []
+    agent_future_tracks: List[Dict[str, Any]] = []
     if metric_cache is None:
-        return gt, objects
+        return gt, objects, agent_future_tracks
 
     try:
         if getattr(metric_cache, "human_trajectory", None) is not None:
@@ -162,11 +222,48 @@ def extract_gt_traj_and_objects(metric_cache) -> Tuple[Optional[np.ndarray], Lis
                 y = float(getattr(center, "y", 0.0))
                 width = float(getattr(box, "width", 1.8))
                 length = float(getattr(box, "length", 4.5))
-                objects.append({"type": typ, "x": x, "y": y, "heading": heading, "width": width, "length": length})
+                token = safe_str(getattr(getattr(obj, "metadata", None), "track_token", getattr(obj, "track_token", "")))
+                objects.append({"type": typ, "x": x, "y": y, "heading": heading, "width": width, "length": length, "track_token": token})
     except Exception:
         objects = []
 
-    return gt, objects
+    # Background-agent future trajectories from current + future detection tracks.
+    # These are the tracks PDM uses to judge interactions/collisions, so plotting them is
+    # critical for checking whether CoT mentions the relevant actors and intentions.
+    try:
+        det_frames = []
+        if getattr(metric_cache, "current_tracked_objects", None):
+            det_frames.extend(metric_cache.current_tracked_objects)
+        if getattr(metric_cache, "future_tracked_objects", None):
+            det_frames.extend(metric_cache.future_tracked_objects)
+        tracks: Dict[str, Dict[str, Any]] = {}
+        for t_idx, frame_det in enumerate(det_frames):
+            for obj in frame_det.tracked_objects.tracked_objects:
+                typ = str(obj.tracked_object_type).split(".")[-1].lower()
+                box = obj.box
+                center = box.center
+                x = float(getattr(center, "x", 0.0))
+                y = float(getattr(center, "y", 0.0))
+                if not (abs(x) <= 80 and abs(y) <= 50):
+                    continue
+                token = safe_str(getattr(getattr(obj, "metadata", None), "track_token", getattr(obj, "track_token", "")))
+                if not token:
+                    token = f"obj_{len(tracks)}_{typ}"
+                rec = tracks.setdefault(token, {"track_token": token, "type": typ, "points": []})
+                rec["points"].append((t_idx, x, y))
+        for rec in tracks.values():
+            pts = sorted(rec["points"], key=lambda p: p[0])
+            if len(pts) >= 2:
+                arr = np.asarray([[p[1], p[2]] for p in pts], dtype=float)
+                min_dist = float(np.min(np.sqrt(arr[:, 0] ** 2 + arr[:, 1] ** 2)))
+                rec["xy"] = arr
+                rec["min_dist"] = min_dist
+                agent_future_tracks.append(rec)
+        agent_future_tracks = sorted(agent_future_tracks, key=lambda r: r.get("min_dist", 1e9))[:25]
+    except Exception:
+        agent_future_tracks = []
+
+    return gt, objects, agent_future_tracks
 
 
 def object_patch(obj: Dict[str, Any]) -> Rectangle:
@@ -203,7 +300,7 @@ def build_case_title(row: pd.Series, idx: int) -> str:
     return f"#{idx:03d} token={token[:18]}  PDM={pdm:.3f}  CoT-Traj={cons:.3f}  weak={weak:.3f}"
 
 
-def plot_case(row: pd.Series, idx: int, output_path: Path, metric_cache_path: Optional[str] = None):
+def plot_case(row: pd.Series, idx: int, output_path: Path, metric_cache_path: Optional[str] = None, navsim_log_path: Optional[str] = None, sensor_blobs_path: Optional[str] = None):
     token = safe_str(row.get("token", ""))
     xs = parse_json_list(row.get("pred_traj_x", "[]"))
     ys = parse_json_list(row.get("pred_traj_y", "[]"))
@@ -212,12 +309,14 @@ def plot_case(row: pd.Series, idx: int, output_path: Path, metric_cache_path: Op
     pred_feat = trajectory_features(xs, ys, hs)
 
     metric_cache = load_metric_cache(metric_cache_path, token) if metric_cache_path else None
-    gt, objects = extract_gt_traj_and_objects(metric_cache)
+    gt, objects, agent_tracks = extract_gt_traj_and_objects(metric_cache)
+    front_img = get_front_camera_image(token, navsim_log_path, sensor_blobs_path)
 
-    fig = plt.figure(figsize=(18, 10), dpi=150)
-    gs = fig.add_gridspec(2, 3, width_ratios=[1.35, 1.05, 1.05], height_ratios=[1.25, 0.85], wspace=0.28, hspace=0.30)
+    fig = plt.figure(figsize=(20, 11), dpi=150)
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.25, 1.15, 1.35], height_ratios=[1.05, 0.85], wspace=0.25, hspace=0.28)
     ax_text = fig.add_subplot(gs[:, 0])
-    ax_bev = fig.add_subplot(gs[0, 1:])
+    ax_cam = fig.add_subplot(gs[0, 1])
+    ax_bev = fig.add_subplot(gs[0, 2])
     ax_bar = fig.add_subplot(gs[1, 1])
     ax_feat = fig.add_subplot(gs[1, 2])
 
@@ -262,29 +361,22 @@ def plot_case(row: pd.Series, idx: int, output_path: Path, metric_cache_path: Op
         text_blocks.append(wrap_text(answer, width=72, max_lines=4))
     ax_text.text(0.0, 1.0, "\n".join(text_blocks), va="top", ha="left", fontsize=8.5, family="monospace")
 
+    # Front camera panel.
+    ax_cam.set_title("Current front camera (cam_f0)")
+    ax_cam.axis("off")
+    if front_img is not None:
+        ax_cam.imshow(front_img)
+    else:
+        ax_cam.text(0.5, 0.5, "Front camera unavailable\n(pass --navsim_log_path and --sensor_blobs_path,\nor set OPENSCENE_DATA_ROOT)", ha="center", va="center", fontsize=10)
+
     # BEV plot.
     ax_bev.set_title("BEV trajectory: predicted vs GT (ego frame)")
     ax_bev.axhline(0, color="0.85", lw=1)
     ax_bev.axvline(0, color="0.85", lw=1)
     ax_bev.scatter([0], [0], c="black", s=55, marker="*", label="ego@now", zorder=5)
 
-    if objects:
-        patches = []
-        colors = []
-        for obj in objects:
-            x, y = obj.get("x", 0.0), obj.get("y", 0.0)
-            if abs(x) <= 60 and abs(y) <= 35:
-                patches.append(object_patch(obj))
-                typ = obj.get("type", "")
-                if "ped" in typ or "bicycle" in typ or "cycl" in typ:
-                    colors.append("tab:red")
-                elif "vehicle" in typ:
-                    colors.append("tab:orange")
-                else:
-                    colors.append("tab:gray")
-        if patches:
-            pc = PatchCollection(patches, facecolor=colors, edgecolor="none", alpha=0.28, label="objects")
-            ax_bev.add_collection(pc)
+    draw_static_objects(ax_bev, objects)
+    draw_agent_future_tracks(ax_bev, agent_tracks, reveal_fraction=1.0, alpha=0.65)
 
     if gt is not None and len(gt) >= 2:
         ax_bev.plot(gt[:, 0], gt[:, 1], "-o", color="tab:green", lw=2.5, ms=4, label="GT/human")
@@ -293,21 +385,9 @@ def plot_case(row: pd.Series, idx: int, output_path: Path, metric_cache_path: Op
         ax_bev.plot(pred[:, 0], pred[:, 1], "-o", color="tab:blue", lw=2.5, ms=4, label="Alpamayo pred")
         ax_bev.scatter([pred[-1, 0]], [pred[-1, 1]], c="tab:blue", s=55, marker="x")
 
-    # Auto bounds.
-    pts = [[0.0, 0.0]]
-    if pred is not None and len(pred):
-        pts.extend(pred[:, :2].tolist())
-    if gt is not None and len(gt):
-        pts.extend(gt[:, :2].tolist())
-    for obj in objects[:80]:
-        pts.append([obj.get("x", 0.0), obj.get("y", 0.0)])
-    pts = np.asarray(pts, dtype=float)
-    finite = pts[np.isfinite(pts).all(axis=1)]
-    if len(finite):
-        xmin, ymin = finite.min(axis=0)
-        xmax, ymax = finite.max(axis=0)
-        ax_bev.set_xlim(min(-10, xmin - 8), max(30, xmax + 8))
-        ax_bev.set_ylim(min(-20, ymin - 8), max(20, ymax + 8))
+    xmin, xmax, ymin, ymax = compute_plot_bounds(pred, gt, objects, agent_tracks)
+    ax_bev.set_xlim(xmin, xmax)
+    ax_bev.set_ylim(ymin, ymax)
     ax_bev.set_aspect("equal", adjustable="box")
     ax_bev.set_xlabel("x forward / meters")
     ax_bev.set_ylabel("y left / meters")
@@ -416,7 +496,7 @@ def select_cases(df: pd.DataFrame, mode: str, top_k: int, tokens: Optional[List[
     return df.sort_values("weak_case_score", ascending=False).head(top_k).copy()
 
 
-def compute_plot_bounds(pred: Optional[np.ndarray], gt: Optional[np.ndarray], objects: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
+def compute_plot_bounds(pred: Optional[np.ndarray], gt: Optional[np.ndarray], objects: List[Dict[str, Any]], agent_tracks: Optional[List[Dict[str, Any]]] = None) -> Tuple[float, float, float, float]:
     pts = [[0.0, 0.0]]
     if pred is not None and len(pred):
         pts.extend(pred[:, :2].tolist())
@@ -424,6 +504,10 @@ def compute_plot_bounds(pred: Optional[np.ndarray], gt: Optional[np.ndarray], ob
         pts.extend(gt[:, :2].tolist())
     for obj in objects[:80]:
         pts.append([obj.get("x", 0.0), obj.get("y", 0.0)])
+    for tr in (agent_tracks or [])[:25]:
+        xy = tr.get("xy")
+        if xy is not None:
+            pts.extend(np.asarray(xy, dtype=float).tolist())
     pts_arr = np.asarray(pts, dtype=float)
     finite = pts_arr[np.isfinite(pts_arr).all(axis=1)]
     if len(finite):
@@ -454,7 +538,33 @@ def draw_static_objects(ax, objects: List[Dict[str, Any]]):
         ax.add_collection(pc)
 
 
-def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: Optional[str] = None, duration_ms: int = 450):
+def draw_agent_future_tracks(ax, agent_tracks: List[Dict[str, Any]], reveal_fraction: float = 1.0, alpha: float = 0.65):
+    """Draw other agents' future tracks in BEV."""
+    if not agent_tracks:
+        return
+    for i, tr in enumerate(agent_tracks):
+        xy = tr.get("xy")
+        if xy is None or len(xy) < 2:
+            continue
+        xy = np.asarray(xy, dtype=float)
+        k = max(2, int(math.ceil(len(xy) * max(0.0, min(1.0, reveal_fraction)))))
+        xy_show = xy[:k]
+        typ = tr.get("type", "")
+        if "ped" in typ or "bicycle" in typ or "cycl" in typ:
+            color = "tab:red"
+            label = "other vulnerable future" if i == 0 else None
+        elif "vehicle" in typ:
+            color = "tab:orange"
+            label = "other vehicle future" if i == 0 else None
+        else:
+            color = "tab:gray"
+            label = "other object future" if i == 0 else None
+        ax.plot(xy[:, 0], xy[:, 1], "--", color=color, lw=1.0, alpha=0.18)
+        ax.plot(xy_show[:, 0], xy_show[:, 1], "-", color=color, lw=1.7, alpha=alpha, label=label)
+        ax.scatter([xy_show[-1, 0]], [xy_show[-1, 1]], c=color, s=18, alpha=alpha, zorder=4)
+
+
+def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: Optional[str] = None, duration_ms: int = 450, navsim_log_path: Optional[str] = None, sensor_blobs_path: Optional[str] = None):
     """Create one GIF for one NavSim planning scene.
 
     NavSim evaluation output has one 4s future trajectory per token. This GIF does not stitch
@@ -473,11 +583,12 @@ def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: O
     pred = np.asarray(list(zip(xs, ys, hs if len(hs) == len(xs) else [0.0] * len(xs))), dtype=float) if xs and ys else None
 
     metric_cache = load_metric_cache(metric_cache_path, token) if metric_cache_path else None
-    gt, objects = extract_gt_traj_and_objects(metric_cache)
+    gt, objects, agent_tracks = extract_gt_traj_and_objects(metric_cache)
+    front_img = get_front_camera_image(token, navsim_log_path, sensor_blobs_path)
     n_pred = len(pred) if pred is not None else 0
     n_gt = len(gt) if gt is not None else 0
     n_steps = max(n_pred, n_gt, 1)
-    xmin, xmax, ymin, ymax = compute_plot_bounds(pred, gt, objects)
+    xmin, xmax, ymin, ymax = compute_plot_bounds(pred, gt, objects, agent_tracks)
 
     cot = wrap_text(safe_str(row.get("cot", "")), width=58, max_lines=11)
     meta = wrap_text(safe_str(row.get("meta_action", "")), width=58, max_lines=3)
@@ -488,12 +599,20 @@ def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: O
 
     frames = []
     for step in range(n_steps + 1):
-        fig = plt.figure(figsize=(14, 7.5), dpi=120)
-        gs = fig.add_gridspec(1, 2, width_ratios=[0.95, 1.45], wspace=0.22)
-        ax_text = fig.add_subplot(gs[0, 0])
-        ax = fig.add_subplot(gs[0, 1])
+        fig = plt.figure(figsize=(15.5, 8.5), dpi=120)
+        gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.45], height_ratios=[0.78, 1.0], wspace=0.18, hspace=0.18)
+        ax_cam = fig.add_subplot(gs[0, 0])
+        ax_text = fig.add_subplot(gs[1, 0])
+        ax = fig.add_subplot(gs[:, 1])
         t_sec = min(step, 8) * 0.5
         fig.suptitle(f"Scene #{idx:03d} token={token[:18]}  t=+{t_sec:.1f}s  PDM={pdm:.3f}  CoT-Traj={cons:.3f}", fontsize=13, fontweight="bold")
+
+        ax_cam.set_title("Current front camera (cam_f0)")
+        ax_cam.axis("off")
+        if front_img is not None:
+            ax_cam.imshow(front_img)
+        else:
+            ax_cam.text(0.5, 0.5, "front camera unavailable", ha="center", va="center")
 
         ax_text.axis("off")
         text_lines = [
@@ -515,6 +634,8 @@ def make_case_gif(row: pd.Series, idx: int, gif_path: Path, metric_cache_path: O
         ax.axvline(0, color="0.85", lw=1)
         ax.scatter([0], [0], c="black", s=70, marker="*", label="ego@now", zorder=5)
         draw_static_objects(ax, objects)
+        reveal_fraction = step / max(n_steps, 1)
+        draw_agent_future_tracks(ax, agent_tracks, reveal_fraction=reveal_fraction, alpha=0.75)
 
         if gt is not None and len(gt) >= 2:
             ax.plot(gt[:, 0], gt[:, 1], "--", color="tab:green", lw=1.5, alpha=0.25, label="GT full")
@@ -554,7 +675,9 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize CoT + predicted trajectory + PDM metrics for Alpamayo NavSim cases")
     parser.add_argument("--scores_csv", required=True, help="alpamayo_pdm_scores_merged.csv")
     parser.add_argument("--analysis_csv", default=None, help="optional cot_failure_pattern_enriched.csv or cot_consistency_analysis.csv")
-    parser.add_argument("--metric_cache_path", default=None, help="optional metric_cache directory for GT trajectory and objects")
+    parser.add_argument("--metric_cache_path", default=None, help="optional metric_cache directory for GT trajectory, objects, and other-agent futures")
+    parser.add_argument("--navsim_log_path", default=None, help="optional navsim_logs/mini path for loading front camera; auto-inferred if omitted")
+    parser.add_argument("--sensor_blobs_path", default=None, help="optional sensor_blobs/mini path for loading front camera; auto-inferred if omitted")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--select", choices=["weakest", "low_pdm", "inconsistent", "all"], default="weakest")
     parser.add_argument("--top_k", type=int, default=30)
@@ -566,6 +689,14 @@ def main():
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    data_root = infer_data_root_from_scores(args.scores_csv)
+    if args.metric_cache_path is None and data_root is not None:
+        args.metric_cache_path = str(data_root / "metric_cache")
+    if args.navsim_log_path is None and data_root is not None:
+        args.navsim_log_path = str(data_root / "navsim_logs" / "mini")
+    if args.sensor_blobs_path is None and data_root is not None:
+        args.sensor_blobs_path = str(data_root / "sensor_blobs" / "mini")
 
     df = load_and_merge(args.scores_csv, args.analysis_csv)
     df = add_basic_ranking_columns(df)
@@ -586,12 +717,12 @@ def main():
         safe_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", token)[:80]
         out_path = output_dir / f"case_{i:03d}_{safe_token}.png"
         print(f"[viz] {i}/{len(chosen)} token={token} -> {out_path}", flush=True)
-        plot_case(row, i, out_path, metric_cache_path=args.metric_cache_path)
+        plot_case(row, i, out_path, metric_cache_path=args.metric_cache_path, navsim_log_path=args.navsim_log_path, sensor_blobs_path=args.sensor_blobs_path)
         image_paths.append(out_path)
         if make_case_gifs_flag:
             gif_path = output_dir / f"case_{i:03d}_{safe_token}.gif"
             print(f"[viz] {i}/{len(chosen)} token={token} -> {gif_path}", flush=True)
-            make_case_gif(row, i, gif_path, metric_cache_path=args.metric_cache_path, duration_ms=args.gif_duration_ms)
+            make_case_gif(row, i, gif_path, metric_cache_path=args.metric_cache_path, duration_ms=args.gif_duration_ms, navsim_log_path=args.navsim_log_path, sensor_blobs_path=args.sensor_blobs_path)
             gif_paths.append(gif_path)
 
     print(f"[viz] selected_csv: {selected_csv}", flush=True)
