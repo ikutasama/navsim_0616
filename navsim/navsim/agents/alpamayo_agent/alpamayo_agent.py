@@ -80,6 +80,10 @@ class AlpamayoAgent(AbstractAgent):
         self._device = device
         self._model = None
         self._processor = None
+        self._last_cot_text = ""
+        self._last_meta_action_text = ""
+        self._last_answer_text = ""
+        self._last_extra = None
 
     def name(self) -> str:
         return "Alpamayo1_5Agent"
@@ -156,10 +160,33 @@ class AlpamayoAgent(AbstractAgent):
                 return_extra=True,
             )
 
+        # Save generated text outputs for downstream analysis.
+        # extra is produced by alpamayo1_5.models.token_utils.extract_text_tokens()
+        # and usually contains keys: cot, meta_action, answer with shape [B, ns, nj].
+        self._last_extra = extra
+        self._last_cot_text = self._extract_first_text(extra, "cot")
+        self._last_meta_action_text = self._extract_first_text(extra, "meta_action")
+        self._last_answer_text = self._extract_first_text(extra, "answer")
+
         # Step 6: Convert Alpamayo output to NavSim Trajectory
         trajectory = self._convert_output_to_trajectory(pred_xyz, pred_rot)
 
         return trajectory
+
+    @staticmethod
+    def _extract_first_text(extra, key: str) -> str:
+        """Best-effort extraction of the first generated text string from Alpamayo extra dict."""
+        try:
+            if extra is None or key not in extra:
+                return ""
+            value = extra[key]
+            if hasattr(value, "flatten"):
+                value = value.flatten()[0]
+            elif isinstance(value, (list, tuple)):
+                value = value[0]
+            return str(value)
+        except Exception:
+            return ""
 
     def _prepare_images(self, agent_input: AgentInput) -> tuple:
         """Extract camera images from NavSim AgentInput and format for Alpamayo.
