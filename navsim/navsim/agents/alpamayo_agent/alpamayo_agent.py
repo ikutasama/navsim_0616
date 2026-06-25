@@ -111,6 +111,18 @@ class AlpamayoAgent(AbstractAgent):
         t0 = time.time()
         print(f"[AlpamayoAgent] loading checkpoint from {self._model_path}", flush=True)
         _cuda_report("before load")
+        if str(self._device).startswith("cuda") and torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(torch.cuda.current_device())
+                free_gb = free / 1024**3
+                if free_gb < 50.0:
+                    print(
+                        f"[AlpamayoAgent][warn] only {free_gb:.1f}GiB GPU memory is free before loading Alpamayo-1.5-10B; "
+                        "use an idle 80G GPU or kill stale python processes if loading stalls/OOMs",
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
         # The original official sample loads all shards on CPU and then calls .to('cuda').
         # On the A100 container this can stall for a long time at the CPU->GPU migration
