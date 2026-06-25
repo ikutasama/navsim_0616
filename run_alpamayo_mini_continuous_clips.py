@@ -646,12 +646,50 @@ def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
         procs.append((proc, f, log_path, gpu, rank))
 
     failed = []
-    for proc, f, log_path, gpu, rank in procs:
-        rc = proc.wait()
-        f.close()
-        if rc != 0:
-            failed.append((gpu, rank, rc, log_path))
-        print(f"[continuous-mini][launcher] done gpu={gpu} rank={rank} exit={rc} log={log_path}", flush=True)
+    remaining = {(gpu, rank): (proc, f, log_path) for proc, f, log_path, gpu, rank in procs}
+    log_offsets: Dict[Tuple[str, int], int] = {(gpu, rank): 0 for _, _, _, gpu, rank in procs}
+    poll_sec = max(float(getattr(args, "launcher_poll_sec", 20.0)), 1.0)
+    print(f"[continuous-mini][launcher] child logs are under: {logs_dir}", flush=True)
+    print(f"[continuous-mini][launcher] polling child logs every {poll_sec:.0f}s; model loading can take several minutes", flush=True)
+    while remaining:
+        for key, (proc, f, log_path) in list(remaining.items()):
+            gpu, rank = key
+            try:
+                if log_path.exists():
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as lf:
+                        lf.seek(log_offsets.get(key, 0))
+                        new_text = lf.read()
+                        log_offsets[key] = lf.tell()
+                    if new_text.strip():
+                        lines = new_text.splitlines()
+                        for line in lines[-40:]:
+                            print(f"[gpu{gpu}/rank{rank}] {line}", flush=True)
+            except Exception as e:
+                print(f"[continuous-mini][launcher][warn] cannot read log {log_path}: {e}", flush=True)
+
+            rc = proc.poll()
+            if rc is not None:
+                # Drain remaining log text once more before reporting done.
+                try:
+                    if log_path.exists():
+                        with open(log_path, "r", encoding="utf-8", errors="replace") as lf:
+                            lf.seek(log_offsets.get(key, 0))
+                            tail_text = lf.read()
+                            log_offsets[key] = lf.tell()
+                        if tail_text.strip():
+                            for line in tail_text.splitlines()[-80:]:
+                                print(f"[gpu{gpu}/rank{rank}] {line}", flush=True)
+                except Exception:
+                    pass
+                f.close()
+                if rc != 0:
+                    failed.append((gpu, rank, rc, log_path))
+                print(f"[continuous-mini][launcher] done gpu={gpu} rank={rank} exit={rc} log={log_path}", flush=True)
+                del remaining[key]
+        if remaining:
+            alive = ", ".join([f"gpu{gpu}/rank{rank}" for gpu, rank in remaining.keys()])
+            print(f"[continuous-mini][launcher] still running: {alive}", flush=True)
+            time.sleep(poll_sec)
 
     if failed:
         for gpu, rank, rc, log_path in failed:
@@ -692,6 +730,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.98)
     parser.add_argument("--max_generation_length", type=int, default=256)
+    parser.add_argument("--launcher_poll_sec", type=float, default=20.0, help="launcher mode: seconds between child-log progress polls")
     args = parser.parse_args()
 
     gpu_ids = parse_gpu_spec(args.gpu)
