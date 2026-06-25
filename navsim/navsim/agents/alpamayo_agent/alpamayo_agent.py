@@ -23,6 +23,8 @@ Key adaptation points:
    We interpolate from NavSim's sparse history to fill 16 steps.
 """
 
+import os
+
 import numpy as np
 import torch
 import scipy.spatial.transform as spt
@@ -124,35 +126,47 @@ class AlpamayoAgent(AbstractAgent):
             except Exception:
                 pass
 
-        # The original official sample loads all shards on CPU and then calls .to('cuda').
-        # On the A100 container this can stall for a long time at the CPU->GPU migration
-        # boundary for a 10B model. Prefer Transformers/Accelerate direct dispatch so
-        # shards are materialized on the target GPU as they are read, avoiding the large
-        # CPU-resident copy plus a monolithic model.to(cuda) pass.
-        load_kwargs = {"dtype": torch.bfloat16}
-        if str(self._device).startswith("cuda"):
-            load_kwargs.update({"device_map": {"": self._device}, "low_cpu_mem_usage": True})
+        # Loading knobs for remote debugging:
+        # - ALPAMAYO_ATTN_IMPLEMENTATION defaults to sdpa. The HF config defaults to
+        #   flash_attention_2, which has produced misleading dtype warnings and can make
+        #   load/inference failures harder to distinguish from I/O stalls.
+        # - ALPAMAYO_LOAD_MODE=direct dispatches shards directly to the target GPU.
+        # - ALPAMAYO_LOAD_MODE=cpu loads on CPU first, then calls .to(device), matching
+        #   NVIDIA's sample. This is useful if Accelerate/device_map stalls at shard 0/5.
+        load_mode = os.environ.get("ALPAMAYO_LOAD_MODE", "direct").strip().lower()
+        attn_impl = os.environ.get("ALPAMAYO_ATTN_IMPLEMENTATION", "sdpa").strip().lower()
+        if attn_impl in {"", "none", "null"}:
+            attn_impl = None
+        print(f"[AlpamayoAgent] load_mode={load_mode} attn_implementation={attn_impl}", flush=True)
 
-        try:
-            model = Alpamayo1_5.from_pretrained(self._model_path, **load_kwargs)
-            if str(self._device).startswith("cuda"):
-                print(f"[AlpamayoAgent] checkpoint loaded directly on {self._device} in {time.time() - t0:.1f}s", flush=True)
-                self._model = model.eval()
-            else:
-                print(f"[AlpamayoAgent] checkpoint loaded on CPU in {time.time() - t0:.1f}s", flush=True)
-                self._model = model.to(self._device).eval()
-        except Exception as e:
-            if "device_map" not in load_kwargs:
-                raise
-            print(f"[AlpamayoAgent][warn] direct device_map load failed: {type(e).__name__}: {e}", flush=True)
-            print("[AlpamayoAgent][warn] falling back to CPU load then model.to(device)", flush=True)
-            t_fallback = time.time()
-            model = Alpamayo1_5.from_pretrained(self._model_path, dtype=torch.bfloat16)
-            print(f"[AlpamayoAgent] fallback checkpoint loaded on CPU/meta in {time.time() - t_fallback:.1f}s; moving to {self._device}", flush=True)
-            _cuda_report("before fallback .to")
+        base_kwargs = {"dtype": torch.bfloat16}
+        if attn_impl is not None:
+            base_kwargs["attn_implementation"] = attn_impl
+
+        if load_mode == "cpu" or not str(self._device).startswith("cuda"):
+            model = Alpamayo1_5.from_pretrained(self._model_path, **base_kwargs)
+            print(f"[AlpamayoAgent] checkpoint loaded on CPU/meta in {time.time() - t0:.1f}s; moving to {self._device}", flush=True)
+            _cuda_report("before .to")
             t1 = time.time()
             self._model = model.to(self._device).eval()
-            print(f"[AlpamayoAgent] fallback model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
+            print(f"[AlpamayoAgent] model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
+        else:
+            load_kwargs = dict(base_kwargs)
+            load_kwargs.update({"device_map": {"": self._device}, "low_cpu_mem_usage": True})
+            try:
+                model = Alpamayo1_5.from_pretrained(self._model_path, **load_kwargs)
+                print(f"[AlpamayoAgent] checkpoint loaded directly on {self._device} in {time.time() - t0:.1f}s", flush=True)
+                self._model = model.eval()
+            except Exception as e:
+                print(f"[AlpamayoAgent][warn] direct device_map load failed: {type(e).__name__}: {e}", flush=True)
+                print("[AlpamayoAgent][warn] falling back to CPU load then model.to(device)", flush=True)
+                t_fallback = time.time()
+                model = Alpamayo1_5.from_pretrained(self._model_path, **base_kwargs)
+                print(f"[AlpamayoAgent] fallback checkpoint loaded on CPU/meta in {time.time() - t_fallback:.1f}s; moving to {self._device}", flush=True)
+                _cuda_report("before fallback .to")
+                t1 = time.time()
+                self._model = model.to(self._device).eval()
+                print(f"[AlpamayoAgent] fallback model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
 
         _cuda_report("after model load")
         self._processor = helper.get_processor(self._model.tokenizer)
