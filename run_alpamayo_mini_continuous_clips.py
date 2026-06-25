@@ -23,6 +23,9 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 from io import BytesIO
@@ -415,6 +418,149 @@ def analyze_and_write_outputs(frame_df: pd.DataFrame, clip_df: pd.DataFrame, out
     (output_dir / "continuous_analysis_report.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_gpu_spec(spec: Optional[str]) -> List[str]:
+    """Parse GPU spec like '0', '0-3', '0,1,2,3', or '0 1' (if shell quoted)."""
+    if spec is None:
+        return []
+    s = str(spec).strip()
+    if not s:
+        return []
+    parts = re.split(r"[,+\s]+", s)
+    gpus: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+            step = 1 if end >= start else -1
+            gpus.extend([str(i) for i in range(start, end + step, step)])
+        else:
+            gpus.append(str(int(part)))
+    out: List[str] = []
+    seen = set()
+    for g in gpus:
+        if g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
+
+
+def merge_shard_outputs(output_dir: Path, shard_dirs: List[Path]) -> None:
+    """Merge shard CSVs/reports and collect GIFs into one user-facing output_dir."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    clips = []
+    gifs_dir = output_dir / "gifs"
+    gifs_dir.mkdir(parents=True, exist_ok=True)
+    for shard_dir in shard_dirs:
+        f_csv = shard_dir / "continuous_frame_results.csv"
+        c_csv = shard_dir / "continuous_clip_summary.csv"
+        if f_csv.exists():
+            frames.append(pd.read_csv(f_csv))
+        if c_csv.exists():
+            cdf = pd.read_csv(c_csv)
+            new_paths = []
+            for p in cdf.get("gif_path", pd.Series([""] * len(cdf))).fillna("").astype(str).tolist():
+                if p and Path(p).exists():
+                    dst = gifs_dir / Path(p).name
+                    if not dst.exists():
+                        shutil.copy2(p, dst)
+                    new_paths.append(str(dst))
+                else:
+                    new_paths.append(p)
+            if "gif_path" in cdf.columns:
+                cdf["gif_path"] = new_paths
+            clips.append(cdf)
+        for gif in (shard_dir / "gifs").glob("*.gif"):
+            dst = gifs_dir / gif.name
+            if not dst.exists():
+                shutil.copy2(gif, dst)
+
+    frame_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    clip_df = pd.concat(clips, ignore_index=True) if clips else pd.DataFrame()
+    if len(frame_df) and "clip_index" in frame_df.columns:
+        frame_df = frame_df.sort_values(["clip_index", "frame_index"], kind="stable")
+    if len(clip_df) and "clip_index" in clip_df.columns:
+        clip_df = clip_df.sort_values("clip_index", kind="stable")
+    if len(frame_df) and len(clip_df) and "gif_path" in frame_df.columns and "gif_path" in clip_df.columns:
+        gif_map = dict(zip(clip_df["clip_index"], clip_df["gif_path"])); frame_df["gif_path"] = frame_df["clip_index"].map(gif_map).fillna(frame_df["gif_path"])
+    analyze_and_write_outputs(frame_df, clip_df, output_dir)
+    print(f"[continuous-mini][launcher] merged frame rows={len(frame_df)} clip rows={len(clip_df)}", flush=True)
+    print(f"[continuous-mini][launcher] merged output_dir: {output_dir}", flush=True)
+    print(f"[continuous-mini][launcher] merged gifs_dir: {gifs_dir}", flush=True)
+
+
+def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else infer_data_root(repo_dir) / "exp" / "mini_continuous_alpamayo" / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    logs_dir = output_dir / "logs"
+    shards_dir = output_dir / "shards"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[continuous-mini][launcher] GPUs: {gpu_ids}", flush=True)
+    print(f"[continuous-mini][launcher] output_dir: {output_dir}", flush=True)
+
+    procs = []
+    shard_dirs: List[Path] = []
+    base_argv = sys.argv[1:]
+
+    def strip_arg(argv: List[str], value_names: List[str], flag_names: List[str]) -> List[str]:
+        out = []
+        skip = False
+        for item in argv:
+            if skip:
+                skip = False
+                continue
+            if item in value_names:
+                skip = True
+                continue
+            if item in flag_names:
+                continue
+            if any(item.startswith(n + "=") for n in value_names + flag_names):
+                continue
+            out.append(item)
+        return out
+
+    common = strip_arg(base_argv, ["--gpu", "--output_dir", "--start_clip", "--clip_stride"], ["--worker"])
+    for rank, gpu in enumerate(gpu_ids):
+        shard_dir = shards_dir / f"gpu{gpu}_rank{rank}"
+        shard_dirs.append(shard_dir)
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            *common,
+            "--worker",
+            "--gpu", str(gpu),
+            "--start_clip", str(rank),
+            "--clip_stride", str(len(gpu_ids)),
+            "--output_dir", str(shard_dir),
+        ]
+        log_path = logs_dir / f"gpu{gpu}_rank{rank}.log"
+        print(f"[continuous-mini][launcher] start gpu={gpu} rank={rank}: {' '.join(cmd)}", flush=True)
+        f = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(cmd, cwd=str(repo_dir), stdout=f, stderr=subprocess.STDOUT)
+        procs.append((proc, f, log_path, gpu, rank))
+
+    failed = []
+    for proc, f, log_path, gpu, rank in procs:
+        rc = proc.wait()
+        f.close()
+        if rc != 0:
+            failed.append((gpu, rank, rc, log_path))
+        print(f"[continuous-mini][launcher] done gpu={gpu} rank={rank} exit={rc} log={log_path}", flush=True)
+
+    if failed:
+        for gpu, rank, rc, log_path in failed:
+            print(f"[continuous-mini][launcher][FAILED] gpu={gpu} rank={rank} exit={rc} tail {log_path}", flush=True)
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                print("\n".join(lines[-120:]), flush=True)
+            except Exception as e:
+                print(f"cannot read log: {e}", flush=True)
+        raise SystemExit(1)
+
+    merge_shard_outputs(output_dir, shard_dirs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Alpamayo continuous sliding-window inference on all NAVSIM mini clips and make CoT GIFs")
     repo_dir = Path(__file__).resolve().parent
@@ -424,7 +570,8 @@ def main():
     parser.add_argument("--sensor_blobs_path", default=None)
     parser.add_argument("--model_path", default="/data/mnt_m181/z59900495/workspace/model/Alpamayo-1.5-10B")
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--gpu", default=None, help="physical GPU id; sets CUDA_VISIBLE_DEVICES before model load")
+    parser.add_argument("--gpu", default=None, help="GPU id/spec. Single worker: '1'. Launcher: '0-3' or '0,1,2,3' starts one process per GPU")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--device", default="cuda:0", help="logical device inside process; keep cuda:0 when --gpu is set")
     parser.add_argument("--max_clips", type=int, default=0, help="0=all mini logs")
     parser.add_argument("--max_frames_per_clip", type=int, default=0, help="0=all sliding windows in each clip")
@@ -440,6 +587,13 @@ def main():
     parser.add_argument("--max_generation_length", type=int, default=256)
     args = parser.parse_args()
 
+    gpu_ids = parse_gpu_spec(args.gpu)
+    if len(gpu_ids) > 1 and not args.worker:
+        run_multi_gpu_launcher(args, repo_dir, gpu_ids)
+        return
+
+    if len(gpu_ids) == 1:
+        args.gpu = gpu_ids[0]
     if args.gpu is not None and str(args.gpu).strip() != "":
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     data_root = Path(args.data_root).expanduser().resolve()
@@ -478,20 +632,23 @@ def main():
     cuda_memory_report("after model load")
 
     log_files = sorted(navsim_log_path.glob("*.pkl"))
-    selected_logs = log_files[args.start_clip::max(args.clip_stride, 1)]
+    stride = max(args.clip_stride, 1)
+    start = max(args.start_clip, 0)
+    selected_pairs = [(i, p) for i, p in enumerate(log_files) if i >= start and ((i - start) % stride == 0)]
     if args.max_clips > 0:
-        selected_logs = selected_logs[:args.max_clips]
-    if not selected_logs:
+        selected_pairs = selected_pairs[:args.max_clips]
+    if not selected_pairs:
         raise RuntimeError(f"No mini log pkl files found/selected under {navsim_log_path}")
-    print(f"[continuous-mini] selected clips: {len(selected_logs)} / total logs {len(log_files)}", flush=True)
+    print(f"[continuous-mini] selected clips: {len(selected_pairs)} / total logs {len(log_files)}", flush=True)
 
     all_frame_rows: List[Dict[str, Any]] = []
     clip_rows: List[Dict[str, Any]] = []
 
-    for clip_idx, log_path in enumerate(selected_logs, start=args.start_clip + 1):
+    for orig_idx, log_path in selected_pairs:
+        clip_idx = orig_idx + 1
         t_clip = time.time()
         log_name = log_path.stem
-        print(f"[continuous-mini] clip #{clip_idx:04d}/{args.start_clip + len(selected_logs):04d}: {log_name}", flush=True)
+        print(f"[continuous-mini] clip #{clip_idx:04d}/{len(log_files):04d}: {log_name}", flush=True)
         scene_filter = SceneFilter(
             num_history_frames=args.num_history_frames,
             num_future_frames=args.num_future_frames,
