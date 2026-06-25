@@ -311,6 +311,44 @@ def make_clip_gif(clip_rows: pd.DataFrame, gif_path: Path, duration_ms: int = 42
         frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
 
 
+def cuda_memory_report(label: str) -> None:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print(f"[continuous-mini][cuda] {label}: cuda not available", flush=True)
+            return
+        idx = torch.cuda.current_device()
+        allocated = torch.cuda.memory_allocated(idx) / 1024**3
+        reserved = torch.cuda.memory_reserved(idx) / 1024**3
+        max_alloc = torch.cuda.max_memory_allocated(idx) / 1024**3
+        free_b, total_b = torch.cuda.mem_get_info(idx)
+        print(
+            f"[continuous-mini][cuda] {label}: device={idx} name={torch.cuda.get_device_name(idx)} "
+            f"allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB max_alloc={max_alloc:.2f}GiB "
+            f"free={free_b/1024**3:.2f}GiB total={total_b/1024**3:.2f}GiB",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[continuous-mini][cuda] {label}: failed to query cuda memory: {e}", flush=True)
+
+
+def model_residency_report(model: Any) -> None:
+    """Best-effort parameter count by device/dtype to catch accidental CPU/offload loading."""
+    try:
+        counts: Dict[str, int] = {}
+        total = 0
+        for p in model.parameters():
+            n = int(p.numel())
+            total += n
+            key = f"{str(p.device)}|{str(p.dtype)}"
+            counts[key] = counts.get(key, 0) + n
+        print(f"[continuous-mini][model] parameters_total={total/1e9:.3f}B", flush=True)
+        for key, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"[continuous-mini][model]   {key}: {n/1e9:.3f}B params", flush=True)
+    except Exception as e:
+        print(f"[continuous-mini][model] parameter residency report failed: {e}", flush=True)
+
+
 def analyze_and_write_outputs(frame_df: pd.DataFrame, clip_df: pd.DataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_df.to_csv(output_dir / "continuous_frame_results.csv", index=False)
@@ -436,6 +474,8 @@ def main():
     )
     agent.initialize()
     print("[continuous-mini] Alpamayo model loaded", flush=True)
+    model_residency_report(getattr(agent, "_model", None))
+    cuda_memory_report("after model load")
 
     log_files = sorted(navsim_log_path.glob("*.pkl"))
     selected_logs = log_files[args.start_clip::max(args.clip_stride, 1)]
@@ -547,6 +587,8 @@ def main():
                 row.update(pg)
                 frame_rows.append(row)
                 print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} n10={n10} text_pred={finite_float(text_pred):.2f} text_gt={finite_float(text_gt):.2f} fde={finite_float(pg['fde']):.2f} {time.time()-t0:.1f}s", flush=True)
+                if frame_i == 0 or ((frame_i + 1) % 20 == 0):
+                    cuda_memory_report(f"after frame {frame_i+1}")
             except Exception as e:
                 print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} FAILED: {e}", flush=True)
                 frame_rows.append({"clip_index": clip_idx, "log_name": log_name, "frame_index": frame_i, "token": token, "valid": False, "error": str(e)})
