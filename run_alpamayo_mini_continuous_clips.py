@@ -174,6 +174,8 @@ def pred_vs_gt_metrics(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> 
             "ade": np.nan, "fde": np.nan, "heading_abs_err": np.nan,
             "turn_direction_mismatch": False, "lateral_final_err": np.nan,
             "progress_err": np.nan, "traj_bad": False,
+            "traj_bad_reasons": "GT/pred missing",
+            "turn_mismatch_reason": "GT/pred missing",
         }
     n = min(len(pred), len(gt))
     p = np.asarray(pred[:n, :3], dtype=float)
@@ -189,26 +191,86 @@ def pred_vs_gt_metrics(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> 
     p_turn = np.sign(p[-1, 1]) if abs(p[-1, 1]) > 1.0 else 0.0
     g_turn = np.sign(g[-1, 1]) if abs(g[-1, 1]) > 1.0 else 0.0
     turn_mismatch = bool(p_turn != 0 and g_turn != 0 and p_turn != g_turn)
-    traj_bad = bool(fde > 4.0 or ade > 2.0 or heading_err > 0.6 or lateral_err > 3.0 or progress_err > 7.0 or turn_mismatch)
+
+    reasons: List[str] = []
+    if fde > 4.0:
+        reasons.append(f"FDE {fde:.2f}>4.0m")
+    if ade > 2.0:
+        reasons.append(f"ADE {ade:.2f}>2.0m")
+    if heading_err > 0.6:
+        reasons.append(f"heading_err {heading_err:.2f}>0.60rad")
+    if lateral_err > 3.0:
+        reasons.append(f"lateral_final_err {lateral_err:.2f}>3.0m")
+    if progress_err > 7.0:
+        reasons.append(f"progress_err {progress_err:.2f}>7.0m (pred={p_prog:.1f}, gt={g_prog:.1f})")
+    if turn_mismatch:
+        reasons.append("turn direction mismatch")
+    traj_bad = bool(reasons)
+
+    p_turn_label = "left" if p_turn > 0 else "right" if p_turn < 0 else "straight/weak"
+    g_turn_label = "left" if g_turn > 0 else "right" if g_turn < 0 else "straight/weak"
+    turn_reason = f"pred={p_turn_label} final_y={p[-1,1]:.2f}; gt={g_turn_label} final_y={g[-1,1]:.2f}; trigger=both |y|>1m and signs differ" if turn_mismatch else f"no trigger: pred_y={p[-1,1]:.2f}, gt_y={g[-1,1]:.2f}"
+
     return {
         "ade": ade, "fde": fde, "heading_abs_err": heading_err,
         "turn_direction_mismatch": turn_mismatch, "lateral_final_err": lateral_err,
         "progress_err": float(progress_err), "traj_bad": traj_bad,
+        "traj_bad_reasons": "; ".join(reasons) if reasons else "none",
+        "turn_mismatch_reason": turn_reason,
     }
 
 
+def _intent_summary(intent: Dict[str, Any]) -> str:
+    names = [
+        k.replace("intent_", "")
+        for k, v in intent.items()
+        if k.startswith("intent_") and bool(v)
+    ]
+    return ",".join(names) if names else "none"
+
+
+def consistency_score_with_reasons(cot: str, meta: str, answer: str, traj: Optional[np.ndarray], traj_name: str) -> Tuple[float, str]:
+    if traj is None or len(traj) < 2:
+        return np.nan, f"{traj_name} trajectory missing"
+    xs, ys, hs = traj[:, 0].tolist(), traj[:, 1].tolist(), traj[:, 2].tolist()
+    intent = text_intent(cot, meta, answer)
+    tf = traj_features(xs, ys, hs)
+    checks: List[Tuple[bool, str]] = []
+    progress = float(tf["pred_progress"])
+    lat = float(tf["pred_lateral_range"])
+    heading = float(tf["pred_final_heading"])
+    heading_change = float(tf["pred_heading_change"])
+    final_y = float(ys[-1])
+
+    if intent["intent_stop"]:
+        checks.append((progress < 4.0, f"stop expects progress<4.0m; got {progress:.1f}m"))
+    if intent["intent_slow"]:
+        checks.append((progress < 14.0, f"slow/yield/brake expects progress<14.0m; got {progress:.1f}m"))
+    if intent["intent_keep"] and not (intent["intent_left"] or intent["intent_right"]):
+        checks.append((lat < 1.5 and heading_change < 0.35, f"keep/straight expects lat<1.5m and heading_change<0.35rad; got lat={lat:.1f}, dhead={heading_change:.2f}"))
+    if intent["intent_left"] and not intent["intent_right"]:
+        checks.append((heading > 0.05 or final_y > 0.5, f"left expects heading>0.05rad or final_y>0.5m; got heading={heading:.2f}, final_y={final_y:.1f}"))
+    if intent["intent_right"] and not intent["intent_left"]:
+        checks.append((heading < -0.05 or final_y < -0.5, f"right expects heading<-0.05rad or final_y<-0.5m; got heading={heading:.2f}, final_y={final_y:.1f}"))
+    if intent["intent_overtake_or_nudge"]:
+        checks.append((lat > 0.4, f"overtake/nudge/avoid expects lateral_range>0.4m; got {lat:.1f}m"))
+
+    if not checks:
+        return np.nan, f"no text intent trigger; extracted_intents={_intent_summary(intent)}"
+    passed = [ok for ok, _ in checks]
+    failed_reasons = [reason for ok, reason in checks if not ok]
+    score = float(np.mean([1.0 if ok else 0.0 for ok in passed]))
+    if failed_reasons:
+        return score, "; ".join(failed_reasons)
+    return score, f"all checks passed; extracted_intents={_intent_summary(intent)}"
+
+
 def intent_vs_gt_consistency(cot: str, meta: str, answer: str, gt: Optional[np.ndarray]) -> float:
-    if gt is None or len(gt) < 2:
-        return np.nan
-    xs, ys, hs = gt[:, 0].tolist(), gt[:, 1].tolist(), gt[:, 2].tolist()
-    return consistency_score(text_intent(cot, meta, answer), traj_features(xs, ys, hs))
+    return consistency_score_with_reasons(cot, meta, answer, gt, "GT")[0]
 
 
 def text_pred_consistency(cot: str, meta: str, answer: str, pred: Optional[np.ndarray]) -> float:
-    if pred is None or len(pred) < 2:
-        return np.nan
-    xs, ys, hs = pred[:, 0].tolist(), pred[:, 1].tolist(), pred[:, 2].tolist()
-    return consistency_score(text_intent(cot, meta, answer), traj_features(xs, ys, hs))
+    return consistency_score_with_reasons(cot, meta, answer, pred, "pred")[0]
 
 
 def draw_object_boxes(ax, objects: List[Dict[str, Any]]) -> None:
@@ -304,16 +366,23 @@ def make_clip_video(clip_rows: pd.DataFrame, video_path: Path, duration_ms: int 
             ax_cam.text(0.5, 0.5, "image unavailable", ha="center", va="center")
 
         ax_text.axis("off")
-        text = [
-            "META_ACTION", wrap_text(r.get("meta_action", ""), width=58, max_lines=3), "",
-            "COT", wrap_text(r.get("cot", ""), width=58, max_lines=max_text_lines), "",
-            "FLAGS",
+        reason_lines = [
             f"  cot_traj_inconsistent: {bool(r.get('cot_traj_inconsistent', False))}",
+            "    " + wrap_text(r.get("cot_traj_reason", ""), width=70, max_lines=2),
             f"  cot_gt_inconsistent: {bool(r.get('cot_gt_inconsistent', False))}",
+            "    " + wrap_text(r.get("cot_gt_reason", ""), width=70, max_lines=2),
             f"  traj_bad: {bool(r.get('traj_bad', False))}",
+            "    " + wrap_text(r.get("traj_bad_reasons", ""), width=70, max_lines=2),
             f"  turn_mismatch: {bool(r.get('turn_direction_mismatch', False))}",
+            "    " + wrap_text(r.get("turn_mismatch_reason", ""), width=70, max_lines=2),
         ]
-        ax_text.text(0, 1, "\n".join(text), va="top", ha="left", fontsize=8.2, family="monospace")
+        text = [
+            "META_ACTION", wrap_text(r.get("meta_action", ""), width=58, max_lines=2), "",
+            "COT", wrap_text(r.get("cot", ""), width=58, max_lines=max_text_lines), "",
+            "FLAGS + TRIGGER REASONS",
+            *reason_lines,
+        ]
+        ax_text.text(0, 1, "\n".join(text), va="top", ha="left", fontsize=7.2, family="monospace")
 
         ax.set_title("per-timestep future: Alpamayo pred vs human/GT")
         ax.axhline(0, color="0.86", lw=1)
@@ -741,8 +810,8 @@ def main():
                 cot = getattr(agent, "_last_cot_text", "")
                 meta = getattr(agent, "_last_meta_action_text", "")
                 answer = getattr(agent, "_last_answer_text", "")
-                text_pred = text_pred_consistency(cot, meta, answer, pred)
-                text_gt = intent_vs_gt_consistency(cot, meta, answer, gt)
+                text_pred, text_pred_reason = consistency_score_with_reasons(cot, meta, answer, pred, "pred")
+                text_gt, text_gt_reason = consistency_score_with_reasons(cot, meta, answer, gt, "GT")
                 pg = pred_vs_gt_metrics(pred, gt)
                 pred_x, pred_y, pred_h = pred[:, 0].tolist(), pred[:, 1].tolist(), pred[:, 2].tolist()
                 if gt is not None:
@@ -776,6 +845,8 @@ def main():
                     "text_gt_consistency": text_gt,
                     "cot_traj_inconsistent": bool(np.isfinite(text_pred) and text_pred < 0.5),
                     "cot_gt_inconsistent": bool(np.isfinite(text_gt) and text_gt < 0.5),
+                    "cot_traj_reason": text_pred_reason,
+                    "cot_gt_reason": text_gt_reason,
                     "objects_within_10m": n10,
                     "n_objects": len(objs),
                     "min_object_dist": min_dist,
