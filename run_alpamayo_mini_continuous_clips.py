@@ -644,6 +644,10 @@ def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
         f = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(cmd, cwd=str(repo_dir), stdout=f, stderr=subprocess.STDOUT)
         procs.append((proc, f, log_path, gpu, rank))
+        stagger_sec = max(float(getattr(args, "launcher_stagger_sec", 0.0)), 0.0)
+        if stagger_sec > 0 and rank < len(gpu_ids) - 1:
+            print(f"[continuous-mini][launcher] stagger next worker by {stagger_sec:.0f}s to avoid concurrent 10B model load", flush=True)
+            time.sleep(stagger_sec)
 
     failed = []
     remaining = {(gpu, rank): (proc, f, log_path) for proc, f, log_path, gpu, rank in procs}
@@ -731,6 +735,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.98)
     parser.add_argument("--max_generation_length", type=int, default=256)
     parser.add_argument("--launcher_poll_sec", type=float, default=20.0, help="launcher mode: seconds between child-log progress polls")
+    parser.add_argument("--launcher_stagger_sec", type=float, default=0.0, help="launcher mode: seconds to wait between starting GPU workers; use 60-90 if concurrent model load hangs")
     args = parser.parse_args()
 
     gpu_ids = parse_gpu_spec(args.gpu)

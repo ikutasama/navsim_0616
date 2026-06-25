@@ -93,10 +93,19 @@ class AlpamayoAgent(AbstractAgent):
         from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
         from alpamayo1_5 import helper
 
-        self._model = Alpamayo1_5.from_pretrained(
+        import time
+
+        t0 = time.time()
+        print(f"[AlpamayoAgent] loading checkpoint from {self._model_path}", flush=True)
+        model = Alpamayo1_5.from_pretrained(
             self._model_path, dtype=torch.bfloat16
-        ).to(self._device)
+        )
+        print(f"[AlpamayoAgent] checkpoint loaded on CPU/meta in {time.time() - t0:.1f}s; moving to {self._device}", flush=True)
+        t1 = time.time()
+        self._model = model.to(self._device)
+        print(f"[AlpamayoAgent] model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
         self._processor = helper.get_processor(self._model.tokenizer)
+        print(f"[AlpamayoAgent] processor ready; total initialize time {time.time() - t0:.1f}s", flush=True)
 
     def get_sensor_config(self) -> SensorConfig:
         """Request cameras for the current frame only (index 3 = most recent)."""
