@@ -95,15 +95,54 @@ class AlpamayoAgent(AbstractAgent):
 
         import time
 
+        def _cuda_report(where: str) -> None:
+            if not str(self._device).startswith("cuda") or not torch.cuda.is_available():
+                return
+            try:
+                idx = torch.cuda.current_device()
+                free, total = torch.cuda.mem_get_info(idx)
+                print(
+                    f"[AlpamayoAgent] cuda mem {where}: free={free/1024**3:.1f}GiB total={total/1024**3:.1f}GiB device={idx}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[AlpamayoAgent][warn] cuda mem report failed at {where}: {e}", flush=True)
+
         t0 = time.time()
         print(f"[AlpamayoAgent] loading checkpoint from {self._model_path}", flush=True)
-        model = Alpamayo1_5.from_pretrained(
-            self._model_path, dtype=torch.bfloat16
-        )
-        print(f"[AlpamayoAgent] checkpoint loaded on CPU/meta in {time.time() - t0:.1f}s; moving to {self._device}", flush=True)
-        t1 = time.time()
-        self._model = model.to(self._device)
-        print(f"[AlpamayoAgent] model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
+        _cuda_report("before load")
+
+        # The original official sample loads all shards on CPU and then calls .to('cuda').
+        # On the A100 container this can stall for a long time at the CPU->GPU migration
+        # boundary for a 10B model. Prefer Transformers/Accelerate direct dispatch so
+        # shards are materialized on the target GPU as they are read, avoiding the large
+        # CPU-resident copy plus a monolithic model.to(cuda) pass.
+        load_kwargs = {"dtype": torch.bfloat16}
+        if str(self._device).startswith("cuda"):
+            load_kwargs.update({"device_map": {"": self._device}, "low_cpu_mem_usage": True})
+
+        try:
+            model = Alpamayo1_5.from_pretrained(self._model_path, **load_kwargs)
+            if str(self._device).startswith("cuda"):
+                print(f"[AlpamayoAgent] checkpoint loaded directly on {self._device} in {time.time() - t0:.1f}s", flush=True)
+                self._model = model.eval()
+            else:
+                print(f"[AlpamayoAgent] checkpoint loaded on CPU in {time.time() - t0:.1f}s", flush=True)
+                self._model = model.to(self._device).eval()
+        except Exception as e:
+            if "device_map" not in load_kwargs:
+                raise
+            print(f"[AlpamayoAgent][warn] direct device_map load failed: {type(e).__name__}: {e}", flush=True)
+            print("[AlpamayoAgent][warn] falling back to CPU load then model.to(device)", flush=True)
+            t_fallback = time.time()
+            model = Alpamayo1_5.from_pretrained(self._model_path, dtype=torch.bfloat16)
+            print(f"[AlpamayoAgent] fallback checkpoint loaded on CPU/meta in {time.time() - t_fallback:.1f}s; moving to {self._device}", flush=True)
+            _cuda_report("before fallback .to")
+            t1 = time.time()
+            self._model = model.to(self._device).eval()
+            print(f"[AlpamayoAgent] fallback model moved to {self._device} in {time.time() - t1:.1f}s", flush=True)
+
+        _cuda_report("after model load")
         self._processor = helper.get_processor(self._model.tokenizer)
         print(f"[AlpamayoAgent] processor ready; total initialize time {time.time() - t0:.1f}s", flush=True)
 
