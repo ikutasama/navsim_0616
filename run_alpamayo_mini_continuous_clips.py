@@ -1,16 +1,16 @@
 """
-Run Alpamayo1.5 on NAVSIM mini as true continuous sliding-window clips and make CoT GIFs.
+Run Alpamayo1.5 on NAVSIM mini as true continuous sliding-window clips and make CoT MP4 videos.
 
 This script is for qualitative/diagnostic analysis, not official NAVSIM PDM scoring.
 It differs from run_alpamayo_eval.py:
-- uses SceneFilter(frame_interval=1) so consecutive GIF frames are consecutive NAVSIM frames;
+- uses SceneFilter(frame_interval=1) so consecutive video frames are consecutive NAVSIM frames;
 - runs Alpamayo inference at every timestep in each mini log/clip;
-- writes one GIF per clip with changing front camera + per-timestep CoT + pred-vs-GT future;
+- writes one MP4 video per clip with changing front camera + per-timestep CoT + pred-vs-GT future;
 - computes clip-level scene complexity and CoT/trajectory inconsistency statistics.
 
 Example:
   cd /data/mnt_m181/zhn/navsim_0616 && python run_alpamayo_mini_continuous_clips.py \
-    --gpu 1 --max_clips 0 --max_frames_per_clip 0 --gif_every_n_clips 1 \
+    --gpu 1 --max_clips 0 --max_frames_per_clip 0 --video_every_n_clips 1 \
     --output_dir /data/mnt_m181/zhn/navsim_0616/navsim/navsim_dataset/exp/mini_continuous_alpamayo
 
 Notes:
@@ -222,10 +222,45 @@ def draw_object_boxes(ax, objects: List[Dict[str, Any]]) -> None:
         ax.add_patch(rect)
 
 
-def make_clip_gif(clip_rows: pd.DataFrame, gif_path: Path, duration_ms: int = 420, max_text_lines: int = 8) -> None:
+def write_mp4_with_ffmpeg(frames: List[np.ndarray], video_path: Path, fps: float) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required to write MP4 videos. Install ffmpeg or imageio-ffmpeg, then rerun.")
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    # H.264 yuv420p requires even dimensions. Crop one pixel if needed.
+    h2, w2 = h - (h % 2), w - (w % 2)
+    frames = [np.ascontiguousarray(f[:h2, :w2, :3], dtype=np.uint8) for f in frames]
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24", "-s", f"{w2}x{h2}", "-r", f"{fps:.3f}", "-i", "-",
+        "-an", "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(video_path),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    for frame in frames:
+        proc.stdin.write(frame.tobytes())
+    proc.stdin.close()
+    err = proc.stderr.read() if proc.stderr is not None else b""
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg failed to write {video_path}: {err.decode('utf-8', errors='replace')}")
+
+
+def make_clip_video(clip_rows: pd.DataFrame, video_path: Path, duration_ms: int = 420, max_text_lines: int = 8) -> None:
     from PIL import Image
 
-    frames = []
+    frames: List[np.ndarray] = []
     # fixed bounds across clip based on pred/gt/object extent
     pts = [[0.0, 0.0], [55.0, 0.0], [-8.0, -22.0], [-8.0, 22.0]]
     for _, r in clip_rows.iterrows():
@@ -303,15 +338,15 @@ def make_clip_gif(clip_rows: pd.DataFrame, gif_path: Path, duration_ms: int = 42
         ax.legend(loc="best", fontsize=8)
 
         buf = BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
+        fig.savefig(buf, format="png")
         plt.close(fig)
         buf.seek(0)
-        frames.append(Image.open(buf).convert("RGB"))
+        frames.append(np.asarray(Image.open(buf).convert("RGB")))
 
     if frames:
         frames.extend([frames[-1]] * 2)
-        gif_path.parent.mkdir(parents=True, exist_ok=True)
-        frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
+        fps = max(1.0, 1000.0 / max(float(duration_ms), 1.0))
+        write_mp4_with_ffmpeg(frames, video_path, fps=fps)
 
 
 def cuda_memory_report(label: str) -> None:
@@ -408,12 +443,12 @@ def analyze_and_write_outputs(frame_df: pd.DataFrame, clip_df: pd.DataFrame, out
             )
         lines.append("")
         lines.append("Top clips by CoT-vs-pred inconsistency:")
-        cols = ["clip_index", "log_name", "complexity_level", "cot_traj_inconsistency_rate", "cot_gt_inconsistency_rate", "traj_bad_rate", "mean_fde", "gif_path"]
+        cols = ["clip_index", "log_name", "complexity_level", "cot_traj_inconsistency_rate", "cot_gt_inconsistency_rate", "traj_bad_rate", "mean_fde", "video_path"]
         for _, r in clip_df.sort_values("cot_traj_inconsistency_rate", ascending=False).head(20).iterrows():
             lines.append(
                 f"  #{int(r['clip_index']):04d} level={int(r['complexity_level'])} "
                 f"cot_pred={r['cot_traj_inconsistency_rate']:.3f} cot_gt={r['cot_gt_inconsistency_rate']:.3f} "
-                f"traj_bad={r['traj_bad_rate']:.3f} fde={r['mean_fde']:.2f} log={r['log_name']} gif={r.get('gif_path','')}"
+                f"traj_bad={r['traj_bad_rate']:.3f} fde={r['mean_fde']:.2f} log={r['log_name']} video={r.get('video_path', r.get('gif_path',''))}"
             )
     (output_dir / "continuous_analysis_report.txt").write_text("\n".join(lines), encoding="utf-8")
 
@@ -447,12 +482,12 @@ def parse_gpu_spec(spec: Optional[str]) -> List[str]:
 
 
 def merge_shard_outputs(output_dir: Path, shard_dirs: List[Path]) -> None:
-    """Merge shard CSVs/reports and collect GIFs into one user-facing output_dir."""
+    """Merge shard CSVs/reports and collect MP4 videos into one user-facing output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
     frames = []
     clips = []
-    gifs_dir = output_dir / "gifs"
-    gifs_dir.mkdir(parents=True, exist_ok=True)
+    videos_dir = output_dir / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
     for shard_dir in shard_dirs:
         f_csv = shard_dir / "continuous_frame_results.csv"
         c_csv = shard_dir / "continuous_clip_summary.csv"
@@ -461,21 +496,22 @@ def merge_shard_outputs(output_dir: Path, shard_dirs: List[Path]) -> None:
         if c_csv.exists():
             cdf = pd.read_csv(c_csv)
             new_paths = []
-            for p in cdf.get("gif_path", pd.Series([""] * len(cdf))).fillna("").astype(str).tolist():
+            path_col = "video_path" if "video_path" in cdf.columns else "gif_path"
+            for p in cdf.get(path_col, pd.Series([""] * len(cdf))).fillna("").astype(str).tolist():
                 if p and Path(p).exists():
-                    dst = gifs_dir / Path(p).name
+                    dst = videos_dir / Path(p).name
                     if not dst.exists():
                         shutil.copy2(p, dst)
                     new_paths.append(str(dst))
                 else:
                     new_paths.append(p)
-            if "gif_path" in cdf.columns:
-                cdf["gif_path"] = new_paths
+            cdf["video_path"] = new_paths
+            cdf["gif_path"] = new_paths  # backward-compatible alias for older analysis code
             clips.append(cdf)
-        for gif in (shard_dir / "gifs").glob("*.gif"):
-            dst = gifs_dir / gif.name
+        for video in (shard_dir / "videos").glob("*.mp4"):
+            dst = videos_dir / video.name
             if not dst.exists():
-                shutil.copy2(gif, dst)
+                shutil.copy2(video, dst)
 
     frame_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     clip_df = pd.concat(clips, ignore_index=True) if clips else pd.DataFrame()
@@ -488,7 +524,7 @@ def merge_shard_outputs(output_dir: Path, shard_dirs: List[Path]) -> None:
     analyze_and_write_outputs(frame_df, clip_df, output_dir)
     print(f"[continuous-mini][launcher] merged frame rows={len(frame_df)} clip rows={len(clip_df)}", flush=True)
     print(f"[continuous-mini][launcher] merged output_dir: {output_dir}", flush=True)
-    print(f"[continuous-mini][launcher] merged gifs_dir: {gifs_dir}", flush=True)
+    print(f"[continuous-mini][launcher] merged videos_dir: {videos_dir}", flush=True)
 
 
 def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
@@ -562,7 +598,7 @@ def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Alpamayo continuous sliding-window inference on all NAVSIM mini clips and make CoT GIFs")
+    parser = argparse.ArgumentParser(description="Run Alpamayo continuous sliding-window inference on all NAVSIM mini clips and make CoT MP4 videos")
     repo_dir = Path(__file__).resolve().parent
     data_root = infer_data_root(repo_dir)
     parser.add_argument("--data_root", default=str(data_root))
@@ -579,8 +615,10 @@ def main():
     parser.add_argument("--clip_stride", type=int, default=1, help="process every Nth clip after start_clip, useful for manual sharding")
     parser.add_argument("--num_history_frames", type=int, default=4)
     parser.add_argument("--num_future_frames", type=int, default=10)
-    parser.add_argument("--gif_every_n_clips", type=int, default=1, help="1=gif for every clip; 0 disables GIF writing")
-    parser.add_argument("--gif_duration_ms", type=int, default=420)
+    parser.add_argument("--video_every_n_clips", type=int, default=None, help="1=MP4 for every clip; 0 disables video writing")
+    parser.add_argument("--gif_every_n_clips", type=int, default=None, help="Deprecated alias for --video_every_n_clips")
+    parser.add_argument("--video_duration_ms", type=int, default=None, help="Per-frame video duration in ms")
+    parser.add_argument("--gif_duration_ms", type=int, default=420, help="Deprecated alias for --video_duration_ms")
     parser.add_argument("--save_every_frames", type=int, default=20, help="periodically flush frame CSV")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.98)
@@ -600,8 +638,12 @@ def main():
     navsim_log_path = Path(args.navsim_log_path).expanduser().resolve() if args.navsim_log_path else data_root / "navsim_logs" / "mini"
     sensor_blobs_path = Path(args.sensor_blobs_path).expanduser().resolve() if args.sensor_blobs_path else data_root / "sensor_blobs" / "mini"
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else data_root / "exp" / "mini_continuous_alpamayo" / datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    gifs_dir = output_dir / "gifs"
+    videos_dir = output_dir / "videos"
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.video_every_n_clips is None:
+        args.video_every_n_clips = args.gif_every_n_clips if args.gif_every_n_clips is not None else 1
+    if args.video_duration_ms is None:
+        args.video_duration_ms = args.gif_duration_ms
 
     print("[continuous-mini] ===== resolved paths =====", flush=True)
     print(f"[continuous-mini] data_root: {data_root}", flush=True)
@@ -755,15 +797,15 @@ def main():
 
         valid_rows = pd.DataFrame([r for r in frame_rows if r.get("valid", False)])
         comp = complexity_from_objects_and_motion(n10_values, min_dist_values, curv_values)
-        gif_path = ""
-        if len(valid_rows) and args.gif_every_n_clips > 0 and ((len(clip_rows) % args.gif_every_n_clips) == 0):
+        video_path = ""
+        if len(valid_rows) and args.video_every_n_clips > 0 and ((len(clip_rows) % args.video_every_n_clips) == 0):
             safe_log = re.sub(r"[^A-Za-z0-9_.-]+", "_", log_name)[:80]
-            gif_file = gifs_dir / f"clip_{clip_idx:04d}_complexity{comp['complexity_level']}_{safe_log}.gif"
+            video_file = videos_dir / f"clip_{clip_idx:04d}_complexity{comp['complexity_level']}_{safe_log}.mp4"
             tmp_rows = valid_rows.copy()
             for k, v in comp.items():
                 tmp_rows[f"clip_{k}"] = v
-            make_clip_gif(tmp_rows, gif_file, duration_ms=args.gif_duration_ms)
-            gif_path = str(gif_file)
+            make_clip_video(tmp_rows, video_file, duration_ms=args.video_duration_ms)
+            video_path = str(video_file)
 
         if len(valid_rows):
             clip_summary = {
@@ -771,7 +813,8 @@ def main():
                 "log_name": log_name,
                 "num_frames": len(valid_rows),
                 "num_failed_frames": len(frame_rows) - len(valid_rows),
-                "gif_path": gif_path,
+                "video_path": video_path,
+                "gif_path": video_path,  # backward-compatible alias
                 "cot_traj_inconsistency_rate": float(valid_rows["cot_traj_inconsistent"].mean()),
                 "cot_gt_inconsistency_rate": float(valid_rows["cot_gt_inconsistent"].mean()),
                 "traj_bad_rate": float(valid_rows["traj_bad"].mean()),
@@ -786,10 +829,11 @@ def main():
                 if r.get("valid", False):
                     for k, v in comp.items():
                         r[f"clip_{k}"] = v
-                    r["gif_path"] = gif_path
+                    r["video_path"] = video_path
+                    r["gif_path"] = video_path  # backward-compatible alias
         all_frame_rows.extend(frame_rows)
         analyze_and_write_outputs(pd.DataFrame(all_frame_rows), pd.DataFrame(clip_rows), output_dir)
-        print(f"[continuous-mini] clip done #{clip_idx:04d}: complexity={comp['complexity_level']} frames={len(valid_rows)} gif={gif_path} elapsed={time.time()-t_clip:.1f}s", flush=True)
+        print(f"[continuous-mini] clip done #{clip_idx:04d}: complexity={comp['complexity_level']} frames={len(valid_rows)} video={video_path} elapsed={time.time()-t_clip:.1f}s", flush=True)
 
     analyze_and_write_outputs(pd.DataFrame(all_frame_rows), pd.DataFrame(clip_rows), output_dir)
     print("[continuous-mini] ===== DONE =====", flush=True)
@@ -797,7 +841,7 @@ def main():
     print(f"[continuous-mini] frame_csv: {output_dir / 'continuous_frame_results.csv'}", flush=True)
     print(f"[continuous-mini] clip_csv: {output_dir / 'continuous_clip_summary.csv'}", flush=True)
     print(f"[continuous-mini] report: {output_dir / 'continuous_analysis_report.txt'}", flush=True)
-    print(f"[continuous-mini] gifs_dir: {gifs_dir}", flush=True)
+    print(f"[continuous-mini] videos_dir: {videos_dir}", flush=True)
 
 
 if __name__ == "__main__":
