@@ -24,6 +24,7 @@ Key adaptation points:
 """
 
 import os
+from typing import List
 
 import numpy as np
 import torch
@@ -188,6 +189,124 @@ class AlpamayoAgent(AbstractAgent):
 
         return trajectory
 
+    @torch.no_grad()
+    def compute_trajectory_batch(self, agent_inputs: List[AgentInput]) -> List[dict]:
+        """Run batched Alpamayo inference on multiple AgentInputs.
+
+        Returns a list of dicts with keys: trajectory, cot, meta_action, answer.
+        The model natively supports B>1: VLM generate and diffusion denoising
+        both parallelise across the batch dimension, dramatically improving
+        GPU utilisation vs single-frame inference.
+        """
+        from alpamayo1_5 import helper as alp_helper
+        from transformers import pad_sequence
+
+        all_input_ids = []
+        all_attention_masks = []
+        all_pixel_values = []
+        all_image_grid_thw = []
+        all_ego_xyz = []
+        all_ego_rot = []
+
+        for agent_input in agent_inputs:
+            image_frames, camera_indices = self._prepare_images(agent_input)
+            ego_history_xyz, ego_history_rot = self._prepare_ego_history(agent_input)
+
+            frames_flat = image_frames.flatten(0, 1)
+            messages = alp_helper.create_message(
+                frames=frames_flat,
+                camera_indices=camera_indices,
+            )
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                continue_final_message=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+
+            ids = inputs["input_ids"]
+            if ids.dim() == 2 and ids.shape[0] == 1:
+                ids = ids.squeeze(0)
+            all_input_ids.append(ids)
+
+            am = inputs.get("attention_mask")
+            if am is not None:
+                if am.dim() == 2 and am.shape[0] == 1:
+                    am = am.squeeze(0)
+            else:
+                am = torch.ones_like(ids)
+            all_attention_masks.append(am)
+
+            all_pixel_values.append(inputs["pixel_values"])
+            all_image_grid_thw.append(inputs["image_grid_thw"])
+            all_ego_xyz.append(ego_history_xyz)
+            all_ego_rot.append(ego_history_rot)
+
+        # Batch: pad sequences to same length, concat vision data
+        pad_id = self._processor.tokenizer.pad_token_id
+        input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=pad_id)
+        attention_mask = pad_sequence(all_attention_masks, batch_first=True, padding_value=0)
+        pixel_values = torch.cat(all_pixel_values, dim=0)
+        image_grid_thw = torch.cat(all_image_grid_thw, dim=0)
+        ego_history_xyz = torch.cat(all_ego_xyz, dim=0)   # (B, 1, 16, 3)
+        ego_history_rot = torch.cat(all_ego_rot, dim=0)   # (B, 1, 16, 3, 3)
+
+        tokenized_data = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+        }
+        model_inputs = {
+            "tokenized_data": tokenized_data,
+            "ego_history_xyz": ego_history_xyz,
+            "ego_history_rot": ego_history_rot,
+        }
+        model_inputs = alp_helper.to_device(model_inputs, self._device)
+
+        B = len(agent_inputs)
+        torch.cuda.manual_seed_all(42)
+        with torch.autocast(self._device, dtype=torch.bfloat16):
+            pred_xyz, pred_rot, extra = self._model.sample_trajectories_from_data_with_vlm_rollout(
+                data=model_inputs,
+                top_p=self._top_p,
+                temperature=self._temperature,
+                num_traj_samples=self._num_traj_samples,
+                max_generation_length=self._max_generation_length,
+                return_extra=True,
+            )
+
+        results = []
+        for i in range(B):
+            traj = self._convert_output_to_trajectory(pred_xyz, pred_rot, batch_index=i)
+            cot_i = self._extract_indexed_text(extra, "cot", i)
+            meta_i = self._extract_indexed_text(extra, "meta_action", i)
+            answer_i = self._extract_indexed_text(extra, "answer", i)
+            results.append({
+                "trajectory": traj,
+                "cot": cot_i,
+                "meta_action": meta_i,
+                "answer": answer_i,
+            })
+        return results
+
+    @staticmethod
+    def _extract_indexed_text(extra, key: str, idx: int) -> str:
+        """Extract text string at batch index idx from Alpamayo extra dict."""
+        try:
+            if extra is None or key not in extra:
+                return ""
+            value = extra[key]
+            if hasattr(value, "flatten"):
+                value = value.flatten()
+            if isinstance(value, (list, tuple, np.ndarray)):
+                value = value[idx]
+            return str(value)
+        except Exception:
+            return ""
+
     @staticmethod
     def _extract_first_text(extra, key: str) -> str:
         """Best-effort extraction of the first generated text string from Alpamayo extra dict."""
@@ -342,27 +461,21 @@ class AlpamayoAgent(AbstractAgent):
         return ego_history_xyz, ego_history_rot
 
     def _convert_output_to_trajectory(
-        self, pred_xyz: torch.Tensor, pred_rot: torch.Tensor
+        self, pred_xyz: torch.Tensor, pred_rot: torch.Tensor, batch_index: int = 0
     ) -> Trajectory:
         """Convert Alpamayo's 64-step 10Hz 3D prediction to NavSim Trajectory.
 
         Alpamayo output:
-            pred_xyz: (1, 1, num_traj_samples, 64, 3) - x,y,z in ego frame
-            pred_rot: (1, 1, num_traj_samples, 64, 3, 3) - rotation matrices
+            pred_xyz: (B, 1, num_traj_samples, 64, 3) - x,y,z in ego frame
+            pred_rot: (B, 1, num_traj_samples, 64, 3, 3) - rotation matrices
 
         NavSim expects:
             Trajectory with poses (N, 3) where N=8, format [x, y, heading]
             at 0.5Hz over 4 seconds
-
-        Steps:
-        1. Take the best trajectory (minADE among samples if multiple)
-        2. Downsample from 10Hz to 0.5Hz (take every 5th waypoint, 8 total)
-        3. Convert rotation matrix to heading angle
         """
-        # Take first (and likely only) trajectory sample
-        # pred_xyz shape: (1, 1, num_traj_samples, T, 3)
-        xyz = pred_xyz.cpu().numpy()[0, 0, 0]  # (64, 3)
-        rot = pred_rot.cpu().numpy()[0, 0, 0]  # (64, 3, 3)
+        # Take first (and likely only) trajectory sample for the given batch element
+        xyz = pred_xyz.cpu().numpy()[batch_index, 0, 0]  # (64, 3)
+        rot = pred_rot.cpu().numpy()[batch_index, 0, 0]  # (64, 3, 3)
 
         # Alpamayo outputs at 10Hz for 6.4s = 64 waypoints
         # NavSim needs 4s at 0.5Hz = 8 poses

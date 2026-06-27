@@ -19,6 +19,7 @@ Notes:
 """
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -734,6 +735,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.98)
     parser.add_argument("--max_generation_length", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=8, help="number of frames per batch inference call; 1 disables batching")
     parser.add_argument("--launcher_poll_sec", type=float, default=20.0, help="launcher mode: seconds between child-log progress polls")
     parser.add_argument("--launcher_stagger_sec", type=float, default=0.0, help="launcher mode: seconds to wait between starting GPU workers; use 60-90 if concurrent model load hangs")
     args = parser.parse_args()
@@ -831,81 +833,134 @@ def main():
         min_dist_values: List[float] = []
         curv_values: List[float] = []
 
-        for frame_i, token in enumerate(tokens):
-            t0 = time.time()
-            try:
-                frame_list = scene_loader.scene_frames_dicts[token]
-                agent_input = scene_loader.get_agent_input_from_token(token)
-                pred_traj = agent.compute_trajectory(agent_input)
-                pred = np.asarray(pred_traj.poses, dtype=float)
-                gt = gt_trajectory_from_frame_list(frame_list, args.num_history_frames, n_poses=pred.shape[0] if pred.ndim == 2 else 8)
-                current_raw = frame_list[args.num_history_frames - 1]
-                objs = annotation_objects_from_frame(current_raw)
-                n10 = int(sum(1 for o in objs if o.get("dist", 1e9) <= 10.0))
-                min_dist = float(min([o.get("dist", np.inf) for o in objs], default=np.nan))
-                n10_values.append(n10)
-                min_dist_values.append(min_dist)
-                if gt is not None:
-                    gtf = traj_features(gt[:, 0], gt[:, 1], gt[:, 2])
-                    curv_values.append(float(gtf.get("pred_curvature_proxy", np.nan)))
-                else:
-                    curv_values.append(np.nan)
+        batch_size = max(args.batch_size, 1)
+        for batch_start in range(0, len(tokens), batch_size):
+            batch_tokens = tokens[batch_start:batch_start + batch_size]
+            batch_actual = len(batch_tokens)
+            t_batch = time.time()
 
-                cot = getattr(agent, "_last_cot_text", "")
-                meta = getattr(agent, "_last_meta_action_text", "")
-                answer = getattr(agent, "_last_answer_text", "")
-                text_pred, text_pred_reason = consistency_score_with_reasons(cot, meta, answer, pred, "pred")
-                text_gt, text_gt_reason = consistency_score_with_reasons(cot, meta, answer, gt, "GT")
-                pg = pred_vs_gt_metrics(pred, gt)
-                pred_x, pred_y, pred_h = pred[:, 0].tolist(), pred[:, 1].tolist(), pred[:, 2].tolist()
-                if gt is not None:
-                    gt_x, gt_y, gt_h = gt[:, 0].tolist(), gt[:, 1].tolist(), gt[:, 2].tolist()
-                else:
-                    gt_x, gt_y, gt_h = [], [], []
-                front_image_path = ""
+            # Phase 1: load data for all frames in batch (CPU, overlaps with GPU)
+            batch_meta = []
+            for bidx, token in enumerate(batch_tokens):
+                frame_i = batch_start + bidx
                 try:
-                    cam_path = agent_input.cameras[-1].cam_f0.camera_path
-                    if cam_path is not None:
-                        front_image_path = str(sensor_blobs_path / cam_path)
-                except Exception:
-                    pass
-                row = {
-                    "clip_index": clip_idx,
-                    "log_name": log_name,
-                    "frame_index": frame_i,
-                    "token": token,
-                    "time_s": frame_timestamp_s(current_raw, frame_i),
-                    "front_image_path": front_image_path,
-                    "cot": cot,
-                    "meta_action": meta,
-                    "answer": answer,
-                    "pred_traj_x": json.dumps(pred_x),
-                    "pred_traj_y": json.dumps(pred_y),
-                    "pred_traj_heading": json.dumps(pred_h),
-                    "gt_traj_x": json.dumps(gt_x),
-                    "gt_traj_y": json.dumps(gt_y),
-                    "gt_traj_heading": json.dumps(gt_h),
-                    "text_pred_consistency": text_pred,
-                    "text_gt_consistency": text_gt,
-                    "cot_traj_inconsistent": bool(np.isfinite(text_pred) and text_pred < 0.5),
-                    "cot_gt_inconsistent": bool(np.isfinite(text_gt) and text_gt < 0.5),
-                    "cot_traj_reason": text_pred_reason,
-                    "cot_gt_reason": text_gt_reason,
-                    "objects_within_10m": n10,
-                    "n_objects": len(objs),
-                    "min_object_dist": min_dist,
-                    "objects_json": json.dumps(objs[:120]),
-                    "runtime_s": time.time() - t0,
-                    "valid": True,
-                }
-                row.update(pg)
-                frame_rows.append(row)
-                print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} n10={n10} text_pred={finite_float(text_pred):.2f} text_gt={finite_float(text_gt):.2f} fde={finite_float(pg['fde']):.2f} {time.time()-t0:.1f}s", flush=True)
-                if frame_i == 0 or ((frame_i + 1) % 20 == 0):
-                    cuda_memory_report(f"after frame {frame_i+1}")
-            except Exception as e:
-                print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} FAILED: {e}", flush=True)
-                frame_rows.append({"clip_index": clip_idx, "log_name": log_name, "frame_index": frame_i, "token": token, "valid": False, "error": str(e)})
+                    frame_list = scene_loader.scene_frames_dicts[token]
+                    agent_input = scene_loader.get_agent_input_from_token(token)
+                    batch_meta.append((frame_i, token, frame_list, agent_input))
+                except Exception as e:
+                    print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} data load FAILED: {e}", flush=True)
+                    batch_meta.append((frame_i, token, None, None))
+
+            valid_inputs = [m[3] for m in batch_meta if m[3] is not None]
+            results: List[Optional[dict]] = [None] * batch_actual
+
+            # Phase 2: batched GPU inference
+            if valid_inputs:
+                try:
+                    batch_results = agent.compute_trajectory_batch(valid_inputs)
+                    vi = 0
+                    for bidx in range(batch_actual):
+                        if batch_meta[bidx][3] is not None:
+                            results[bidx] = batch_results[vi]
+                            vi += 1
+                except Exception as e:
+                    print(f"  batch inference failed ({batch_actual} frames): {e}; falling back to single-frame", flush=True)
+                    for bidx in range(batch_actual):
+                        if batch_meta[bidx][3] is not None:
+                            try:
+                                traj = agent.compute_trajectory(batch_meta[bidx][3])
+                                results[bidx] = {
+                                    "trajectory": traj,
+                                    "cot": getattr(agent, "_last_cot_text", ""),
+                                    "meta_action": getattr(agent, "_last_meta_action_text", ""),
+                                    "answer": getattr(agent, "_last_answer_text", ""),
+                                }
+                            except Exception as e2:
+                                print(f"  single-frame fallback also failed: {e2}", flush=True)
+
+            batch_elapsed = time.time() - t_batch
+            per_frame = batch_elapsed / batch_actual if batch_actual else 0
+            print(f"  batch [{batch_start+1:03d}-{batch_start+batch_actual:03d}/{len(tokens):03d}] {batch_actual} frames in {batch_elapsed:.1f}s ({per_frame:.1f}s/frame)", flush=True)
+
+            # Phase 3: post-process each frame's result
+            for bidx in range(batch_actual):
+                frame_i, token, frame_list, agent_input = batch_meta[bidx]
+                t0 = time.time()
+                result = results[bidx]
+                if result is None or frame_list is None:
+                    frame_rows.append({"clip_index": clip_idx, "log_name": log_name, "frame_index": frame_i, "token": token, "valid": False, "error": "inference failed"})
+                    continue
+                try:
+                    pred_traj = result["trajectory"]
+                    pred = np.asarray(pred_traj.poses, dtype=float)
+                    gt = gt_trajectory_from_frame_list(frame_list, args.num_history_frames, n_poses=pred.shape[0] if pred.ndim == 2 else 8)
+                    current_raw = frame_list[args.num_history_frames - 1]
+                    objs = annotation_objects_from_frame(current_raw)
+                    n10 = int(sum(1 for o in objs if o.get("dist", 1e9) <= 10.0))
+                    min_dist = float(min([o.get("dist", np.inf) for o in objs], default=np.nan))
+                    n10_values.append(n10)
+                    min_dist_values.append(min_dist)
+                    if gt is not None:
+                        gtf = traj_features(gt[:, 0], gt[:, 1], gt[:, 2])
+                        curv_values.append(float(gtf.get("pred_curvature_proxy", np.nan)))
+                    else:
+                        curv_values.append(np.nan)
+
+                    cot = result["cot"]
+                    meta = result["meta_action"]
+                    answer = result["answer"]
+                    text_pred, text_pred_reason = consistency_score_with_reasons(cot, meta, answer, pred, "pred")
+                    text_gt, text_gt_reason = consistency_score_with_reasons(cot, meta, answer, gt, "GT")
+                    pg = pred_vs_gt_metrics(pred, gt)
+                    pred_x, pred_y, pred_h = pred[:, 0].tolist(), pred[:, 1].tolist(), pred[:, 2].tolist()
+                    if gt is not None:
+                        gt_x, gt_y, gt_h = gt[:, 0].tolist(), gt[:, 1].tolist(), gt[:, 2].tolist()
+                    else:
+                        gt_x, gt_y, gt_h = [], [], []
+                    front_image_path = ""
+                    try:
+                        cam_path = agent_input.cameras[-1].cam_f0.camera_path
+                        if cam_path is not None:
+                            front_image_path = str(sensor_blobs_path / cam_path)
+                    except Exception:
+                        pass
+                    row = {
+                        "clip_index": clip_idx,
+                        "log_name": log_name,
+                        "frame_index": frame_i,
+                        "token": token,
+                        "time_s": frame_timestamp_s(current_raw, frame_i),
+                        "front_image_path": front_image_path,
+                        "cot": cot,
+                        "meta_action": meta,
+                        "answer": answer,
+                        "pred_traj_x": json.dumps(pred_x),
+                        "pred_traj_y": json.dumps(pred_y),
+                        "pred_traj_heading": json.dumps(pred_h),
+                        "gt_traj_x": json.dumps(gt_x),
+                        "gt_traj_y": json.dumps(gt_y),
+                        "gt_traj_heading": json.dumps(gt_h),
+                        "text_pred_consistency": text_pred,
+                        "text_gt_consistency": text_gt,
+                        "cot_traj_inconsistent": bool(np.isfinite(text_pred) and text_pred < 0.5),
+                        "cot_gt_inconsistent": bool(np.isfinite(text_gt) and text_gt < 0.5),
+                        "cot_traj_reason": text_pred_reason,
+                        "cot_gt_reason": text_gt_reason,
+                        "objects_within_10m": n10,
+                        "n_objects": len(objs),
+                        "min_object_dist": min_dist,
+                        "objects_json": json.dumps(objs[:120]),
+                        "runtime_s": time.time() - t0,
+                        "valid": True,
+                    }
+                    row.update(pg)
+                    frame_rows.append(row)
+                    print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} n10={n10} text_pred={finite_float(text_pred):.2f} text_gt={finite_float(text_gt):.2f} fde={finite_float(pg['fde']):.2f}", flush=True)
+                    if frame_i == 0 or ((frame_i + 1) % 20 == 0):
+                        cuda_memory_report(f"after frame {frame_i+1}")
+                except Exception as e:
+                    print(f"  [{frame_i+1:03d}/{len(tokens):03d}] token={token[:10]} post-process FAILED: {e}", flush=True)
+                    frame_rows.append({"clip_index": clip_idx, "log_name": log_name, "frame_index": frame_i, "token": token, "valid": False, "error": str(e)})
 
             if args.save_every_frames > 0 and len(frame_rows) % args.save_every_frames == 0:
                 pd.DataFrame(all_frame_rows + frame_rows).to_csv(output_dir / "continuous_frame_results.partial.csv", index=False)
