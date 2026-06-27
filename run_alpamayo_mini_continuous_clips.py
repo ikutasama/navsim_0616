@@ -627,7 +627,8 @@ def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
             out.append(item)
         return out
 
-    common = strip_arg(base_argv, ["--gpu", "--output_dir", "--start_clip", "--clip_stride"], ["--worker"])
+    common = strip_arg(base_argv, ["--gpu", "--output_dir", "--start_clip", "--clip_stride", "--resume_from_clip"], ["--worker"])
+    resume_from = getattr(args, "resume_from_clip", 0)
     for rank, gpu in enumerate(gpu_ids):
         shard_dir = shards_dir / f"gpu{gpu}_rank{rank}"
         shard_dirs.append(shard_dir)
@@ -636,7 +637,7 @@ def run_multi_gpu_launcher(args, repo_dir: Path, gpu_ids: List[str]) -> None:
             *common,
             "--worker",
             "--gpu", str(gpu),
-            "--start_clip", str(rank),
+            "--start_clip", str(resume_from + rank),
             "--clip_stride", str(len(gpu_ids)),
             "--output_dir", str(shard_dir),
         ]
@@ -725,6 +726,7 @@ def main():
     parser.add_argument("--max_frames_per_clip", type=int, default=0, help="0=all sliding windows in each clip")
     parser.add_argument("--start_clip", type=int, default=0, help="skip first N sorted logs, useful for manual sharding")
     parser.add_argument("--clip_stride", type=int, default=1, help="process every Nth clip after start_clip, useful for manual sharding")
+    parser.add_argument("--resume_from_clip", type=int, default=0, help="resume from clip index N (0-based); in multi-GPU mode, each worker starts at resume_from_clip+rank with stride=num_gpus")
     parser.add_argument("--num_history_frames", type=int, default=4)
     parser.add_argument("--num_future_frames", type=int, default=10)
     parser.add_argument("--video_every_n_clips", type=int, default=None, help="1=MP4 for every clip; 0 disables video writing")
@@ -796,7 +798,7 @@ def main():
         selected_pairs = selected_pairs[:args.max_clips]
     if not selected_pairs:
         raise RuntimeError(f"No mini log pkl files found/selected under {navsim_log_path}")
-    print(f"[continuous-mini] selected clips: {len(selected_pairs)} / total logs {len(log_files)}", flush=True)
+    print(f"[continuous-mini] selected clips: {len(selected_pairs)} / total logs {len(log_files)} (start_clip={start}, stride={stride})", flush=True)
 
     all_frame_rows: List[Dict[str, Any]] = []
     clip_rows: List[Dict[str, Any]] = []
