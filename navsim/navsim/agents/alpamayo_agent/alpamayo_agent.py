@@ -199,7 +199,7 @@ class AlpamayoAgent(AbstractAgent):
         GPU utilisation vs single-frame inference.
         """
         from alpamayo1_5 import helper as alp_helper
-        from transformers import pad_sequence
+        from torch.nn.utils.rnn import pad_sequence
 
         all_input_ids = []
         all_attention_masks = []
